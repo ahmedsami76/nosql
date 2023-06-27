@@ -1,0 +1,17 @@
+# mongodb docker compose
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo
+    container_name: mongodb
+    hostname: mongodb
+    ports:
+      - 27017:27017
+    volumes:
+      - ./database:/data
+    command: mongod --auth
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=P@ssw0rd
+      
