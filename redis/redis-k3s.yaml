@@ -20,7 +20,7 @@ spec:
         volumeMounts:
         - mountPath: /data
           name: redis-data
-      volumes:                       # Add this section at the right indentation level
+      volumes:                     
       - name: redis-data
         persistentVolumeClaim:
           claimName: redis-data
