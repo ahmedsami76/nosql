@@ -1,0 +1,84 @@
+# -----------------------------------------------------------------------------
+# JupyterLab in-cluster, exposed on the host via NodePort 30088.
+# It resolves Redis through the in-cluster DNS name 'redis' (the ClusterIP
+# Service), demonstrating service discovery inside Kubernetes.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jupyter-work
+  namespace: nosql-lab
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jupyter
+  namespace: nosql-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jupyter
+  template:
+    metadata:
+      labels:
+        app: jupyter
+    spec:
+      securityContext:
+        fsGroup: 100            # 'users' group — jovyan's group in the image
+      containers:
+        - name: jupyter
+          image: quay.io/jupyter/scipy-notebook:latest
+          # Install the Redis client, then start the server with a fixed token.
+          command:
+            - bash
+            - -c
+            - |
+              pip install --quiet --no-cache-dir 'redis[hiredis]>=5.0' faker
+              exec start-notebook.py --IdentityProvider.token="$JUPYTER_TOKEN"
+          env:
+            - name: JUPYTER_TOKEN
+              value: "nosql-lab"
+            # Kubernetes DNS: 'redis' resolves to the ClusterIP Service in this
+            # namespace. Fully qualified: redis.nosql-lab.svc.cluster.local
+            - name: REDIS_HOST
+              value: "redis"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: redis-password
+          ports:
+            - containerPort: 8888
+          volumeMounts:
+            - name: work
+              mountPath: /home/jovyan/work
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "2000m", memory: "2Gi" }
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: jupyter-work
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jupyter
+  namespace: nosql-lab
+spec:
+  type: NodePort
+  selector:
+    app: jupyter
+  ports:
+    - port: 8888
+      targetPort: 8888
+      nodePort: 30088        # host-reachable: http://localhost:30088

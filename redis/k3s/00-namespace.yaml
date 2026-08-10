@@ -1,0 +1,8 @@
+# Isolates every object in this module. Delete the namespace to delete the lab.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nosql-lab
+  labels:
+    course: nosql
+    module: "01-key-value"

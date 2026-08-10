@@ -1,0 +1,56 @@
+# -----------------------------------------------------------------------------
+# ConfigMap: the redis.conf, decoupled from the image so it can change without
+# a rebuild. Note it does NOT contain the password — that lives in a Secret and
+# is injected via an ACL/args mechanism below.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: nosql-lab
+data:
+  redis.conf: |
+    bind 0.0.0.0
+    port 6379
+    protected-mode no
+    tcp-backlog 511
+    tcp-keepalive 300
+
+    # Memory ceiling and eviction policy (see II.6 for rationale).
+    maxmemory 512mb
+    maxmemory-policy allkeys-lfu
+    maxmemory-samples 10
+
+    # Persistence: hybrid RDB + AOF onto the PersistentVolume mounted at /data.
+    dir /data
+    appendonly yes
+    appendfsync everysec
+    aof-use-rdb-preamble yes
+    save 900 1
+    save 300 10
+    save 60 10000
+    stop-writes-on-bgsave-error yes
+
+    # Encoding thresholds and observability.
+    hash-max-listpack-entries 128
+    zset-max-listpack-entries 128
+    slowlog-log-slower-than 10000
+    latency-monitor-threshold 100
+    notify-keyspace-events "KEA"
+    loglevel notice
+---
+# -----------------------------------------------------------------------------
+# Secret: the Redis password. 'stringData' lets us write plaintext in the
+# manifest and have Kubernetes base64-encode it.
+# NOTE FOR STUDENTS: base64 is ENCODING, not encryption. In production use
+# sealed-secrets, External Secrets Operator, or Azure Key Vault CSI driver,
+# and enable encryption-at-rest for etcd.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-auth
+  namespace: nosql-lab
+type: Opaque
+stringData:
+  redis-password: "RedisLab2026!"

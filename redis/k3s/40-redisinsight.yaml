@@ -1,0 +1,70 @@
+# -----------------------------------------------------------------------------
+# RedisInsight in-cluster, exposed on the host via NodePort 30054.
+# Stateless enough for a Deployment; a small PVC keeps saved connections.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redisinsight-data
+  namespace: nosql-lab
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redisinsight
+  namespace: nosql-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redisinsight
+  template:
+    metadata:
+      labels:
+        app: redisinsight
+    spec:
+      # The image writes to /data as UID 1000; fsGroup makes the PVC group-writable
+      # so the container can create its SQLite state file.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: redisinsight
+          image: redis/redisinsight:latest
+          ports:
+            - containerPort: 5540
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "1Gi" }
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5540
+            initialDelaySeconds: 20
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: redisinsight-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redisinsight
+  namespace: nosql-lab
+spec:
+  type: NodePort
+  selector:
+    app: redisinsight
+  ports:
+    - port: 5540
+      targetPort: 5540
+      nodePort: 30054        # host-reachable: http://localhost:30054
