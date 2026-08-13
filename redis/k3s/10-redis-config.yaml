@@ -1,7 +1,20 @@
 # -----------------------------------------------------------------------------
-# ConfigMap: the redis.conf, decoupled from the image so it can change without
-# a rebuild. Note it does NOT contain the password — that lives in a Secret and
-# is injected via an ACL/args mechanism below.
+# ConfigMap: the full redis.conf, decoupled from the image so it can change
+# without a rebuild. We deliberately configure rather than accept defaults,
+# because the shipped defaults are tuned for a cache, not for a teaching lab.
+#
+# NOTE: this file contains NO password. 'requirepass' is injected at startup
+# from the Secret below, so the credential never appears in a ConfigMap (which
+# is world-readable to anyone with 'get configmap' in this namespace).
+#
+# !! REDIS CONFIG SYNTAX WARNING — the single most common cause of a Redis pod
+# !! that CrashLoopBackOffs on first boot:
+# !! redis.conf does NOT support trailing comments. Only a line whose FIRST
+# !! non-space character is '#' is treated as a comment. Writing
+# !!     save 900 1        # snapshot after 15 minutes
+# !! makes Redis parse '#', 'snapshot', 'after'... as arguments to 'save' and
+# !! abort with "Invalid save parameters". Every comment below is therefore on
+# !! its own line. Check this first when a config change breaks startup.
 # -----------------------------------------------------------------------------
 apiVersion: v1
 kind: ConfigMap
@@ -10,41 +23,140 @@ metadata:
   namespace: nosql-lab
 data:
   redis.conf: |
+    ################################## NETWORK #################################
+    # Bind to all interfaces INSIDE the pod's network namespace. The namespace
+    # plus the Service is the isolation boundary; nothing outside the cluster
+    # reaches this port except through the Services defined in III.6.
     bind 0.0.0.0
     port 6379
+
+    # Protected mode refuses external connections when no password is set.
+    # We DO set one (via --requirepass from the Secret), so relaxing it is safe.
     protected-mode no
+
+    # Accept backlog. Should be <= net.core.somaxconn on the NODE kernel.
     tcp-backlog 511
+
+    # Close idle client connections after N seconds. 0 = never, which is what
+    # we want for notebooks, where a kernel may sit idle between cells.
+    timeout 0
+
+    # TCP keepalive probe interval — detects half-open connections, which in
+    # Kubernetes happen every time a pod is rescheduled behind a Service.
     tcp-keepalive 300
 
-    # Memory ceiling and eviction policy (see II.6 for rationale).
+    ################################## SECURITY ################################
+    # 'requirepass' is intentionally ABSENT here — see the header comment.
+    #
+    # Rename or disable destructive commands in shared environments. Left
+    # commented so students can experiment with FLUSHALL first, then uncomment
+    # to demonstrate command-level hardening.
+    # rename-command FLUSHALL ""
+    # rename-command CONFIG   "CONFIG_a91f3c"
+
+    ################################## MEMORY ##################################
+    # Hard cap on the dataset. Redis applies maxmemory-policy once this is hit.
+    # Sized small ON PURPOSE so students can trigger eviction in a live demo.
+    # The container memory LIMIT must sit comfortably above this — see III.5.
     maxmemory 512mb
+
+    # allkeys-lfu evicts the least-FREQUENTLY used key across the whole
+    # keyspace — the best general-purpose cache policy. Use 'noeviction' when
+    # Redis is a system of record and silent data loss is unacceptable.
     maxmemory-policy allkeys-lfu
+
+    # Keys sampled per eviction decision. Higher = closer to true LFU, at more
+    # CPU. 5 is the default; 10 is a good accuracy/cost balance.
     maxmemory-samples 10
 
-    # Persistence: hybrid RDB + AOF onto the PersistentVolume mounted at /data.
+    ################################ PERSISTENCE ###############################
+    # Both RDB and AOF land in /data, which is the PersistentVolumeClaim
+    # mounted by the StatefulSet's volumeClaimTemplate.
     dir /data
-    appendonly yes
-    appendfsync everysec
-    aof-use-rdb-preamble yes
+
+    # --- RDB: point-in-time snapshots via fork() + copy-on-write ---
+    # "save <seconds> <changes>" = snapshot if >= <changes> writes in <seconds>.
+    # 15 min / 1 change
     save 900 1
+    # 5 min / 10 changes
     save 300 10
+    # 1 min / 10000 changes
     save 60 10000
+
+    # Refuse writes if the last background save failed — a loud failure beats
+    # silently accepting writes you cannot recover.
     stop-writes-on-bgsave-error yes
 
-    # Encoding thresholds and observability.
+    # LZF-compress strings in the RDB file.
+    rdbcompression yes
+
+    # CRC64 trailer: costs ~10% on load, catches silent corruption.
+    rdbchecksum yes
+
+    dbfilename dump.rdb
+
+    # --- AOF: append-only command log, replayed at startup ---
+    appendonly yes
+    appendfilename "appendonly.aof"
+
+    # Durability dial:
+    #   always   = fsync every write  (safest, slowest)
+    #   everysec = fsync once/second  (default: <= 1s loss window)  <-- our choice
+    #   no       = let the OS flush   (fastest, largest loss window)
+    appendfsync everysec
+
+    # Do not skip AOF fsync while a BGSAVE/AOF-rewrite child runs. 'yes' would
+    # trade durability for latency on a saturated disk.
+    no-appendfsync-on-rewrite no
+
+    # Auto-rewrite (compact) the AOF when it doubles in size, minimum 64 MB.
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 64mb
+
+    # Hybrid persistence: write an RDB preamble into the AOF file. Startup gets
+    # RDB's fast load AND AOF's small loss window. Recommended.
+    aof-use-rdb-preamble yes
+
+    ############################## DATA STRUCTURES #############################
+    # Thresholds where a compact encoding is swapped for a full one. Demo these
+    # live with OBJECT ENCODING before and after crossing a threshold (V.7).
     hash-max-listpack-entries 128
+    hash-max-listpack-value 64
+    list-max-listpack-size 128
+    set-max-intset-entries 512
+    set-max-listpack-entries 128
     zset-max-listpack-entries 128
+    zset-max-listpack-value 64
+
+    ############################### OBSERVABILITY ##############################
+    # Log any command whose EXECUTION exceeds this many microseconds (10 ms).
+    # Inspect with: SLOWLOG GET 10
     slowlog-log-slower-than 10000
+    slowlog-max-len 128
+
+    # Track latency events; read with LATENCY LATEST / LATENCY DOCTOR.
     latency-monitor-threshold 100
+
+    # Keyspace notifications, so we can demo event-driven cache invalidation:
+    #   K = keyspace events, E = keyevent events, A = all classes
     notify-keyspace-events "KEA"
+
     loglevel notice
+
+    ################################# THREADING ################################
+    # I/O threads parallelize socket read/write and protocol parsing ONLY.
+    # Command execution stays single-threaded. Keep this below the container's
+    # CPU limit (1000m in III.5) or the threads just fight for the same quota.
+    io-threads 2
 ---
 # -----------------------------------------------------------------------------
 # Secret: the Redis password. 'stringData' lets us write plaintext in the
-# manifest and have Kubernetes base64-encode it.
-# NOTE FOR STUDENTS: base64 is ENCODING, not encryption. In production use
-# sealed-secrets, External Secrets Operator, or Azure Key Vault CSI driver,
-# and enable encryption-at-rest for etcd.
+# manifest and have Kubernetes base64-encode it on admission.
+#
+# NOTE FOR STUDENTS: base64 is ENCODING, not encryption. Anyone with
+# 'get secret' in this namespace can read it back in one command. In
+# production use sealed-secrets, the External Secrets Operator, or a cloud
+# KMS CSI driver, and enable encryption-at-rest for etcd.
 # -----------------------------------------------------------------------------
 apiVersion: v1
 kind: Secret
