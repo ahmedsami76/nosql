@@ -1,29 +1,15 @@
-# =============================================================================
-# 50-jupyter.yaml — JupyterLab for the NoSQL course, Module 1 (Redis)
-#
-# Provides the Python client environment for the lab. Reaches Redis through
-# in-cluster DNS ('redis' -> the ClusterIP Service) and is reachable from the
-# HOST machine at http://localhost:30088/lab?token=nosql-lab via NodePort.
-#
-# Apply AFTER 00-namespace.yaml, 10-redis-config.yaml and 30-redis-service.yaml.
-# Verify prerequisites exist before applying:
-#   kubectl -n nosql-lab get configmap redis-config secret redis-auth svc redis
-# =============================================================================
-
 # -----------------------------------------------------------------------------
-# PersistentVolumeClaim — notebooks survive pod restarts and rescheduling.
-# K3s ships local-path-provisioner as the default StorageClass, so this binds
-# automatically with no extra setup.
+# JupyterLab in-cluster, exposed on the host via NodePort 30088.
+# It resolves Redis through the in-cluster DNS name 'redis' (the ClusterIP
+# Service), which is service discovery in Kubernetes demonstrated in one line.
+# The PVC at /home/jovyan/work holds BOTH the notebooks and the generated
+# dataset (VI.1), so nothing is lost when the pod restarts.
 # -----------------------------------------------------------------------------
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: jupyter-work
   namespace: nosql-lab
-  labels:
-    app: jupyter
-    course: nosql
-    module: "01-key-value"
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: local-path
@@ -31,26 +17,13 @@ spec:
     requests:
       storage: 2Gi
 ---
-# -----------------------------------------------------------------------------
-# Deployment (not StatefulSet): Jupyter has no stable-identity or ordinal
-# requirement. Its only state is the notebook directory, held on the PVC above.
-# -----------------------------------------------------------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: jupyter
   namespace: nosql-lab
-  labels:
-    app: jupyter
-    course: nosql
-    module: "01-key-value"
 spec:
   replicas: 1
-  # Recreate, not RollingUpdate: the PVC is ReadWriteOnce, so two pods cannot
-  # mount it simultaneously. A rolling update would deadlock with the new pod
-  # stuck Pending on a volume the old pod still holds.
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
       app: jupyter
@@ -59,133 +32,25 @@ spec:
       labels:
         app: jupyter
     spec:
-      # =======================================================================
-      # CRITICAL — disable legacy Docker-link environment variable injection.
-      #
-      # By default Kubernetes injects link-style variables into every pod for
-      # each Service in the namespace, in the form:
-      #     <SERVICENAME>_PORT=tcp://<clusterIP>:<port>
-      #
-      # Our Service is named 'jupyter', so the pod receives:
-      #     JUPYTER_PORT=tcp://10.43.144.55:8888
-      #
-      # Jupyter Server reads JUPYTER_PORT as its listen port and calls int()
-      # on it, crashing at startup with:
-      #     ValueError: invalid literal for int() with base 10: 'tcp://...'
-      #
-      # The identical collision would set REDIS_PORT=tcp://10.43.x.x:6379 and
-      # break int(os.getenv("REDIS_PORT")) inside the course notebooks.
-      #
-      # Setting this to false suppresses the injection entirely. This is the
-      # correct fix; renaming Services to dodge the collision is not.
-      # =======================================================================
-      enableServiceLinks: false
-
-      # The jupyter/* images run as UID 1000 (jovyan), GID 100 (users).
-      # fsGroup makes the PVC group-owned by 100; fsGroupChangePolicy ensures
-      # ownership is applied even when the local-path provisioner creates the
-      # backing directory as root:root, which otherwise makes /home/jovyan/work
-      # unwritable and aborts server startup.
       securityContext:
-        runAsUser: 1000
-        runAsGroup: 100
-        fsGroup: 100
-        fsGroupChangePolicy: "Always"
-
-      # Wait for Redis to accept authenticated connections before starting the
-      # notebook server, so the very first cell a student runs succeeds.
-      initContainers:
-        - name: wait-for-redis
-          image: redis:8-alpine
-          command:
-            - sh
-            - -c
-            - |
-              echo "Waiting for Redis at ${REDIS_HOST}:${REDIS_PORT}..."
-              # Retry for up to ~2.5 minutes (30 attempts x 5s), then fail
-              # loudly so the pod surfaces the problem instead of hanging.
-              for i in $(seq 1 30); do
-                if redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" \
-                             -a "$REDIS_PASSWORD" --no-auth-warning ping 2>/dev/null | grep -q PONG; then
-                  echo "Redis is ready."
-                  exit 0
-                fi
-                echo "  attempt $i/30 — not ready yet, retrying in 5s"
-                sleep 5
-              done
-              echo "ERROR: Redis did not become ready in time." >&2
-              exit 1
-          env:
-            - name: REDIS_HOST
-              value: "redis"
-            - name: REDIS_PORT
-              value: "6379"
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: redis-auth
-                  key: redis-password
-          resources:
-            requests: { cpu: "50m",  memory: "64Mi" }
-            limits:   { cpu: "200m", memory: "128Mi" }
-
+        fsGroup: 100            # 'users' group — jovyan's group in the image
       containers:
         - name: jupyter
-          # Official Jupyter Docker Stacks image. The scipy variant already
-          # ships pandas, numpy and matplotlib.
-          #
-          # PINNING: ':latest' is used here for convenience, but for classroom
-          # delivery pin a dated tag (e.g. quay.io/jupyter/scipy-notebook:2024-10-28)
-          # or a digest, so every student gets a byte-identical environment
-          # regardless of which day they pull.
           image: quay.io/jupyter/scipy-notebook:latest
-          imagePullPolicy: IfNotPresent
-
+          # Install the Redis clients, then start the server with a fixed token.
+          # In a locked-down environment, bake these into a custom image instead
+          # of pip-installing at boot — a pod restart should not need egress.
           command:
             - bash
             - -c
             - |
-              set -euo pipefail
-
-              # Install the Redis client (hiredis = fast C protocol parser).
-              # NOT quiet: if this fails we want the error in the pod logs
-              # rather than a silent crash later. '|| true' keeps a transient
-              # registry hiccup from killing the whole container — the notebook
-              # server is still useful and pip can be rerun from a cell.
-              pip install --no-cache-dir 'redis[hiredis]>=5.0' faker || true
-
-              # start-notebook.py replaced start-notebook.sh in the 2023
-              # Jupyter Docker Stacks refactor. Support both so the manifest
-              # survives an image tag that predates the rename.
-              if command -v start-notebook.py >/dev/null 2>&1; then
-                exec start-notebook.py \
-                  --IdentityProvider.token="${JUPYTER_TOKEN}" \
-                  --ServerApp.ip=0.0.0.0 \
-                  --ServerApp.port=8888 \
-                  --ServerApp.root_dir=/home/jovyan
-              else
-                exec start-notebook.sh \
-                  --NotebookApp.token="${JUPYTER_TOKEN}" \
-                  --NotebookApp.ip=0.0.0.0 \
-                  --NotebookApp.port=8888
-              fi
-
+              pip install --quiet --no-cache-dir 'redis[hiredis]>=5.0' faker
+              exec start-notebook.py --IdentityProvider.token="$JUPYTER_TOKEN"
           env:
-            # Fixed token so the course URL is stable across restarts.
-            # Use a random token in any shared or internet-reachable setup.
             - name: JUPYTER_TOKEN
               value: "nosql-lab"
-
-            # Explicit port. Belt-and-braces alongside enableServiceLinks:false —
-            # a user-defined env entry takes precedence over an injected one,
-            # so this alone would also defeat the JUPYTER_PORT collision.
-            - name: JUPYTER_PORT
-              value: "8888"
-
             # Kubernetes DNS: 'redis' resolves to the ClusterIP Service in this
             # namespace. Fully qualified: redis.nosql-lab.svc.cluster.local
-            # These names match the Docker Compose path exactly, so the SAME
-            # notebook runs unmodified on both platforms.
             - name: REDIS_HOST
               value: "redis"
             - name: REDIS_PORT
@@ -195,103 +60,37 @@ spec:
                 secretKeyRef:
                   name: redis-auth
                   key: redis-password
-
-            # Quality-of-life settings for the container environment.
-            - name: PIP_DISABLE_PIP_VERSION_CHECK
-              value: "1"
-            - name: PYTHONUNBUFFERED
-              value: "1"          # stream Python output straight to pod logs
-            - name: GRANT_SUDO
-              value: "no"         # keep the notebook user unprivileged
-
           ports:
-            - name: http
-              containerPort: 8888
-              protocol: TCP
-
+            - containerPort: 8888
           volumeMounts:
             - name: work
-              mountPath: /home/jovyan/work      # notebooks (persisted)
-            - name: data
-              mountPath: /home/jovyan/data      # shared course dataset
-
+              mountPath: /home/jovyan/work
           resources:
-            requests:
-              cpu: "250m"
-              memory: "512Mi"
-            limits:
-              cpu: "2000m"
-              memory: "2Gi"
-
-          # Startup probe carries the slow first boot (pip install + server
-          # init) so liveness does not kill the pod mid-startup.
-          # 30 x 10s = up to 5 minutes of grace.
-          startupProbe:
-            httpGet:
-              path: /api
-              port: 8888
-            periodSeconds: 10
-            failureThreshold: 30
-
-          # Is the server still alive? Restart if not.
-          livenessProbe:
-            httpGet:
-              path: /api
-              port: 8888
-            periodSeconds: 20
-            timeoutSeconds: 5
-            failureThreshold: 3
-
-          # Should this pod receive traffic from the Service?
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "2000m", memory: "2Gi" }
           readinessProbe:
             httpGet:
               path: /api
               port: 8888
+            # Generous: the pip install must finish before the server starts.
+            initialDelaySeconds: 45
             periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
-
-          securityContext:
-            allowPrivilegeEscalation: false
-
-      # Give the kernel time to checkpoint notebooks before SIGKILL.
-      terminationGracePeriodSeconds: 30
-
+            failureThreshold: 12
       volumes:
         - name: work
           persistentVolumeClaim:
             claimName: jupyter-work
-        # emptyDir for the shared dataset: it is regenerated by the
-        # generate_dataset.py cell inside the notebook. To ship the dataset
-        # into the cluster instead, replace this with a ConfigMap created via:
-        #   kubectl -n nosql-lab create configmap retail-dataset \
-        #     --from-file=retail_events.json=./data/retail_events.json
-        # (note: ConfigMaps cap at ~1 MiB, so a larger dataset needs a PVC)
-        - name: data
-          emptyDir: {}
 ---
-# -----------------------------------------------------------------------------
-# NodePort Service — makes JupyterLab reachable from the HOST machine at
-# http://localhost:30088. NodePort (not Ingress) keeps the lab consistent with
-# the Redis NodePort and avoids depending on Traefik being healthy.
-#
-# NOTE: naming this Service 'jupyter' is what triggers the JUPYTER_PORT
-# injection defused by enableServiceLinks:false above.
-# -----------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
   name: jupyter
   namespace: nosql-lab
-  labels:
-    app: jupyter
 spec:
   type: NodePort
   selector:
     app: jupyter
   ports:
-    - name: http
-      port: 8888
+    - port: 8888
       targetPort: 8888
       nodePort: 30088        # host-reachable: http://localhost:30088
-      protocol: TCP

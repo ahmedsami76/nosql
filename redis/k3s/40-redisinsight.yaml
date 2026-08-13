@@ -1,6 +1,7 @@
 # -----------------------------------------------------------------------------
 # RedisInsight in-cluster, exposed on the host via NodePort 30054.
-# Stateless enough for a Deployment; a small PVC keeps saved connections.
+# Stateless enough for a Deployment; a small PVC keeps saved connections and
+# UI preferences across restarts.
 # -----------------------------------------------------------------------------
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -29,8 +30,8 @@ spec:
       labels:
         app: redisinsight
     spec:
-      # The image writes to /data as UID 1000; fsGroup makes the PVC group-writable
-      # so the container can create its SQLite state file.
+      # The image writes to /data as UID 1000; fsGroup makes the PVC
+      # group-writable so the container can create its SQLite state file.
       securityContext:
         fsGroup: 1000
       containers:

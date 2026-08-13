@@ -1,10 +1,10 @@
 # -----------------------------------------------------------------------------
 # StatefulSet (not Deployment) because Redis is stateful:
 #   * stable network identity  -> redis-0.redis-headless.nosql-lab.svc
-#   * stable per-pod storage   -> volumeClaimTemplates binds PVC to pod ordinal
+#   * stable per-pod storage   -> volumeClaimTemplates binds a PVC to the ordinal
 #   * ordered, graceful rollout
-# K3s ships local-path-provisioner as the default StorageClass, so the PVC
-# is satisfied automatically with no extra setup.
+# K3s ships local-path-provisioner as the default StorageClass, so the PVC is
+# satisfied automatically with no extra setup.
 # -----------------------------------------------------------------------------
 apiVersion: apps/v1
 kind: StatefulSet
@@ -12,8 +12,8 @@ metadata:
   name: redis
   namespace: nosql-lab
 spec:
-  serviceName: redis-headless      # must match the headless Service name
-  replicas: 1                      # single node; see the note on HA below
+  serviceName: redis-headless      # MUST match the headless Service name (III.6)
+  replicas: 1                      # single node; see the HA note below
   selector:
     matchLabels:
       app: redis
@@ -22,8 +22,17 @@ spec:
       labels:
         app: redis
     spec:
-      # Redis warns if the kernel accept backlog is smaller than tcp-backlog.
-      # An init container with privileged access tunes the node sysctl.
+      # fsGroup makes the mounted PVC group-writable by the redis user (999),
+      # so redis-server can create dump.rdb and the appendonlydir. Without it
+      # you get 'Permission denied' on the first BGSAVE on some provisioners.
+      securityContext:
+        fsGroup: 999
+
+      # Redis warns at startup if the node's accept backlog is smaller than
+      # tcp-backlog. This init container tunes the node sysctls. If you already
+      # applied them on the host in III.2, this is belt-and-braces and can be
+      # deleted — which is the cleaner production posture, since it lets you
+      # drop the privileged container entirely.
       initContainers:
         - name: sysctl-tuning
           image: busybox:1.36
@@ -31,7 +40,7 @@ spec:
             - sh
             - -c
             - |
-              # Raise the TCP accept queue so Redis' tcp-backlog 511 is honoured.
+              # Raise the TCP accept queue so tcp-backlog 511 is honoured.
               sysctl -w net.core.somaxconn=1024 || true
               # Allow fork() for BGSAVE even when RSS is large.
               sysctl -w vm.overcommit_memory=1 || true
@@ -41,19 +50,32 @@ spec:
       containers:
         - name: redis
           # Official upstream image, major version pinned for reproducibility.
+          # Check https://hub.docker.com/_/redis for the current stable major.
           image: redis:8-alpine
           imagePullPolicy: IfNotPresent
 
-          # Start redis-server with our ConfigMap file, and append the password
-          # from the Secret as a CLI override so it never appears in the ConfigMap.
+          # Start redis-server with our ConfigMap file, then append the password
+          # from the Secret as a CLI override. Redis applies command-line
+          # arguments AFTER the config file, so this wins — and the credential
+          # never has to live in the ConfigMap.
           command:
             - sh
             - -c
             - |
               exec redis-server /etc/redis/redis.conf \
                    --requirepass "$REDIS_PASSWORD"
+
           env:
             - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: redis-password
+            # redis-cli reads REDISCLI_AUTH automatically. Setting it here means
+            # the probes below (and any 'kubectl exec' you run) authenticate
+            # without ever putting the password in an argv that shows up in
+            # 'ps', in shell history, or in the pod spec's command line.
+            - name: REDISCLI_AUTH
               valueFrom:
                 secretKeyRef:
                   name: redis-auth
@@ -70,8 +92,9 @@ spec:
               mountPath: /data           # RDB + AOF on the PersistentVolume
 
           # Requests drive scheduling; the memory LIMIT must exceed 'maxmemory'
-          # (512Mi) with headroom for COW during BGSAVE, client buffers, and
-          # allocator overhead — otherwise the kernel OOM-kills the pod.
+          # (512Mi) with headroom for copy-on-write during BGSAVE, client output
+          # buffers, and allocator overhead — otherwise the kernel OOM-kills the
+          # pod and you get an exit-137 CrashLoopBackOff with no Redis log.
           resources:
             requests:
               cpu: "250m"
@@ -83,17 +106,18 @@ spec:
           # Liveness: is the process alive? Restart if PING fails repeatedly.
           livenessProbe:
             exec:
-              command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
+              command: ["sh", "-c", "redis-cli ping | grep -q PONG"]
             initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 5
 
           # Readiness: should this pod receive traffic? Removed from the Service
-          # endpoints while loading a large AOF/RDB at startup.
+          # endpoints while loading a large AOF/RDB at startup, so clients never
+          # see a half-loaded dataset.
           readinessProbe:
             exec:
-              command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
+              command: ["sh", "-c", "redis-cli ping | grep -q PONG"]
             initialDelaySeconds: 10
             periodSeconds: 5
             timeoutSeconds: 3
@@ -102,6 +126,7 @@ spec:
           securityContext:
             runAsNonRoot: true
             runAsUser: 999             # the 'redis' user in the official image
+            runAsGroup: 999
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
@@ -114,7 +139,8 @@ spec:
           configMap:
             name: redis-config
 
-  # Each pod ordinal gets its own PVC; deleting the pod does NOT delete data.
+  # Each pod ordinal gets its own PVC. Deleting the pod does NOT delete the
+  # data; deleting the StatefulSet does NOT delete the PVC either.
   volumeClaimTemplates:
     - metadata:
         name: redis-data

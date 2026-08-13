@@ -1,7 +1,9 @@
 # -----------------------------------------------------------------------------
 # 1) Headless Service — required by the StatefulSet for stable per-pod DNS:
 #    redis-0.redis-headless.nosql-lab.svc.cluster.local
-# clusterIP: None means no virtual IP and no load balancing; DNS returns pod IPs.
+# clusterIP: None means no virtual IP and no load balancing; DNS returns the
+# pod IPs directly. This is how you address a SPECIFIC replica — essential once
+# you have a primary and replicas and need to talk to one of them by name.
 # -----------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
@@ -20,6 +22,7 @@ spec:
 # -----------------------------------------------------------------------------
 # 2) ClusterIP Service — the normal in-cluster endpoint. Jupyter and
 #    RedisInsight pods connect to the hostname 'redis' on port 6379.
+#    This is the address you will type into RedisInsight in IV.2.
 # -----------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
@@ -36,10 +39,10 @@ spec:
       targetPort: 6379
 ---
 # -----------------------------------------------------------------------------
-# 3) NodePort Service — REQUIRED BY THE BRIEF: makes Redis reachable from the
-#    HOST machine at localhost:30079, so a Jupyter kernel or redis-cli running
-#    outside the cluster can connect. Ingress cannot do this: Redis speaks RESP
-#    over raw TCP, not HTTP, so the Traefik HTTP ingress is the wrong tool.
+# 3) NodePort Service — makes Redis reachable from the HOST at localhost:30079,
+#    so a redis-cli or a Python process running OUTSIDE the cluster can connect.
+#    Ingress cannot do this: Redis speaks RESP over raw TCP, not HTTP, so the
+#    Traefik HTTP ingress that ships with K3s is the wrong tool.
 # -----------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
