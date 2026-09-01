@@ -797,15 +797,138 @@ printf 'vm.overcommit_memory=1\nnet.core.somaxconn=1024\n' | sudo tee /etc/sysct
 `k3s/00-namespace.yaml`:
 
 ```yaml
-# Isolates every object in this module. Deleting the namespace deletes the lab —
-# which is exactly what Appendix B does.
+# =============================================================================
+# 40-redisinsight.yaml
+#
+# RedisInsight in-cluster, exposed on the host via NodePort 30054.
+# Stateless enough for a Deployment; a small PVC keeps saved connections and
+# UI preferences across restarts.
+# =============================================================================
 apiVersion: v1
-kind: Namespace
+kind: PersistentVolumeClaim
 metadata:
-  name: nosql-lab
+  name: redisinsight-data
+  namespace: nosql-lab
   labels:
-    course: nosql
-    module: "01-key-value"
+    app: redisinsight
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redisinsight
+  namespace: nosql-lab
+  labels:
+    app: redisinsight
+spec:
+  replicas: 1
+
+  # ---------------------------------------------------------------------------
+  # Recreate, NOT the default RollingUpdate.
+  #
+  # A RollingUpdate with replicas: 1 starts the NEW pod BEFORE terminating the
+  # old one. Both then want the same ReadWriteOnce PVC, and the new pod either
+  # blocks on the volume or races the old one for the SQLite state file.
+  # 'Recreate' terminates the old pod first. This is the correct strategy for
+  # ANY Deployment backed by a RWO volume.
+  # ---------------------------------------------------------------------------
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: redisinsight
+  template:
+    metadata:
+      labels:
+        app: redisinsight
+    spec:
+      # See the long explanation in 20-redis-statefulset.yaml. Disabling the
+      # legacy Docker-link env var injection prevents REDIS_PORT / JUPYTER_PORT
+      # style collisions. We reach Redis by DNS Service name, not by env var.
+      enableServiceLinks: false
+
+      # The image writes to /data as UID 1000; fsGroup makes the PVC
+      # group-writable so the container can create its SQLite state file.
+      securityContext:
+        fsGroup: 1000
+
+      containers:
+        - name: redisinsight
+          image: redis/redisinsight:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 5540
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5540
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 5540
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 5
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: redisinsight-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redisinsight
+  namespace: nosql-lab
+  labels:
+    app: redisinsight
+spec:
+  type: NodePort
+  selector:
+    app: redisinsight
+  ports:
+    - name: http
+      port: 5540
+      targetPort: 5540
+      nodePort: 30054        # host-reachable: http://localhost:30054
+# =============================================================================
+# CONNECTION REMINDER
+#
+# In the RedisInsight UI, the Host field must be 'redis' — NOT 'localhost'.
+# RedisInsight is a CONTAINER; localhost inside it is its own network
+# namespace, where nothing is listening on 6379. Use the ClusterIP Service
+# name and the SERVICE port (6379), not the NodePort (30079).
+#
+# RedisInsight does NOT receive the password as an environment variable — it
+# stores credentials in its own encrypted local database when you add a
+# connection through the UI. That is why you type the password in by hand.
+# =============================================================================
+
 ```
 
 Set it as your default context namespace so you can stop typing `-n nosql-lab`:
@@ -825,35 +948,52 @@ Two objects live here, and the split between them is the lesson: **non-secret co
 `k3s/10-redis-config.yaml`:
 
 ```yaml
-# -----------------------------------------------------------------------------
-# ConfigMap: the full redis.conf, decoupled from the image so it can change
-# without a rebuild. We deliberately configure rather than accept defaults,
-# because the shipped defaults are tuned for a cache, not for a teaching lab.
+# =============================================================================
+# 10-redis-config.yaml
 #
-# NOTE: this file contains NO password. 'requirepass' is injected at startup
-# from the Secret below, so the credential never appears in a ConfigMap (which
-# is world-readable to anyone with 'get configmap' in this namespace).
+# Two objects, and the split between them is the lesson:
+#   ConfigMap -> non-secret configuration
+#   Secret    -> credentials
+#
+# The ConfigMap carries the full redis.conf, decoupled from the image so it can
+# change without a rebuild. We configure deliberately rather than accept the
+# shipped defaults, because those defaults are tuned for a cache, not a
+# teaching lab.
+#
+# THERE IS NO PASSWORD IN THIS CONFIGMAP. 'requirepass' is injected at startup
+# from the Secret as a command-line override, so the credential never appears
+# in a ConfigMap (which is readable by anyone with 'get configmap' here).
 #
 # !! REDIS CONFIG SYNTAX WARNING — the single most common cause of a Redis pod
 # !! that CrashLoopBackOffs on first boot:
-# !! redis.conf does NOT support trailing comments. Only a line whose FIRST
-# !! non-space character is '#' is treated as a comment. Writing
-# !!     save 900 1        # snapshot after 15 minutes
-# !! makes Redis parse '#', 'snapshot', 'after'... as arguments to 'save' and
-# !! abort with "Invalid save parameters". Every comment below is therefore on
-# !! its own line. Check this first when a config change breaks startup.
-# -----------------------------------------------------------------------------
+# !!
+# !!   redis.conf does NOT support TRAILING comments. Only a line whose FIRST
+# !!   non-space character is '#' is treated as a comment. Writing
+# !!       save 900 1        # snapshot after 15 minutes
+# !!   makes Redis parse '#', 'snapshot', 'after' ... as arguments to 'save'
+# !!   and abort with "Invalid save parameters".
+# !!
+# !! Every comment below is therefore on its own line. Check this FIRST when a
+# !! config change breaks startup.
+#
+# MINIMUM VERSION: 'set-max-listpack-entries' requires Redis 7.2+. On 7.0 the
+# server refuses to start with "Bad directive or wrong number of arguments".
+# The redis:8-alpine image pinned in 20-redis-statefulset.yaml satisfies this.
+# Hash-field TTL commands (HEXPIRE/HTTL) need 7.4+.
+# =============================================================================
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: redis-config
   namespace: nosql-lab
+  labels:
+    app: redis
 data:
   redis.conf: |
     ################################## NETWORK #################################
     # Bind to all interfaces INSIDE the pod's network namespace. The namespace
     # plus the Service is the isolation boundary; nothing outside the cluster
-    # reaches this port except through the Services defined in III.6.
+    # reaches this port except through the Services in 30-redis-service.yaml.
     bind 0.0.0.0
     port 6379
 
@@ -884,12 +1024,15 @@ data:
     ################################## MEMORY ##################################
     # Hard cap on the dataset. Redis applies maxmemory-policy once this is hit.
     # Sized small ON PURPOSE so students can trigger eviction in a live demo.
-    # The container memory LIMIT must sit comfortably above this — see III.5.
+    # The container memory LIMIT must sit comfortably ABOVE this — see the
+    # StatefulSet, which uses 1Gi for this 512mb cap.
     maxmemory 512mb
 
     # allkeys-lfu evicts the least-FREQUENTLY used key across the whole
-    # keyspace — the best general-purpose cache policy. Use 'noeviction' when
-    # Redis is a system of record and silent data loss is unacceptable.
+    # keyspace — the best general-purpose CACHE policy, and it resists a single
+    # large scan flushing the working set.
+    # Use 'noeviction' when Redis is a system of record and silent data loss is
+    # unacceptable: writes then fail loudly instead of evicting.
     maxmemory-policy allkeys-lfu
 
     # Keys sampled per eviction decision. Higher = closer to true LFU, at more
@@ -919,16 +1062,15 @@ data:
 
     # CRC64 trailer: costs ~10% on load, catches silent corruption.
     rdbchecksum yes
-
     dbfilename dump.rdb
 
     # --- AOF: append-only command log, replayed at startup ---
     appendonly yes
     appendfilename "appendonly.aof"
 
-    # Durability dial:
+    # Durability dial — this is a BUSINESS decision, not a tuning knob:
     #   always   = fsync every write  (safest, slowest)
-    #   everysec = fsync once/second  (default: <= 1s loss window)  <-- our choice
+    #   everysec = fsync once/second  (default: <= 1s loss window)  <-- ours
     #   no       = let the OS flush   (fastest, largest loss window)
     appendfsync everysec
 
@@ -946,7 +1088,7 @@ data:
 
     ############################## DATA STRUCTURES #############################
     # Thresholds where a compact encoding is swapped for a full one. Demo these
-    # live with OBJECT ENCODING before and after crossing a threshold (V.7).
+    # live with OBJECT ENCODING before and after crossing a threshold.
     hash-max-listpack-entries 128
     hash-max-listpack-value 64
     list-max-listpack-size 128
@@ -967,40 +1109,39 @@ data:
     # Keyspace notifications, so we can demo event-driven cache invalidation:
     #   K = keyspace events, E = keyevent events, A = all classes
     notify-keyspace-events "KEA"
-
     loglevel notice
 
     ################################# THREADING ################################
-    # I/O threads parallelize socket read/write and protocol parsing ONLY.
-    # Command execution stays single-threaded. Keep this below the container's
-    # CPU limit (1000m in III.5) or the threads just fight for the same quota.
+    # I/O threads parallelize socket read/write and RESP protocol parsing ONLY.
+    # COMMAND EXECUTION REMAINS SINGLE-THREADED. Keep this below the container's
+    # CPU limit or the threads just fight for the same quota.
     io-threads 2
 ---
-# -----------------------------------------------------------------------------
-# Secret: the Redis password. 'stringData' lets us write plaintext in the
-# manifest and have Kubernetes base64-encode it on admission.
+# =============================================================================
+# Secret: the Redis password.
+#
+# 'stringData' lets us write plaintext in the manifest and have Kubernetes
+# base64-encode it on admission.
 #
 # NOTE FOR STUDENTS: base64 is ENCODING, not encryption. Anyone with
-# 'get secret' in this namespace can read it back in one command. In
-# production use sealed-secrets, the External Secrets Operator, or a cloud
+# 'get secret' in this namespace reads it back in one command:
+#   kubectl -n nosql-lab get secret redis-auth \
+#     -o jsonpath='{.data.redis-password}' | base64 -d
+#
+# In production use sealed-secrets, the External Secrets Operator, or a cloud
 # KMS CSI driver, and enable encryption-at-rest for etcd.
-# -----------------------------------------------------------------------------
+# =============================================================================
 apiVersion: v1
 kind: Secret
 metadata:
   name: redis-auth
   namespace: nosql-lab
+  labels:
+    app: redis
 type: Opaque
 stringData:
   redis-password: "RedisLab2026!"
-```
-
-> **Minimum Redis version for this config.** `set-max-listpack-entries` requires **Redis 7.2 or newer** — on 7.0 the server refuses to start with `Bad directive or wrong number of arguments`. The `redis:8-alpine` image we pin satisfies this. If you retarget the lab at an older major, drop that one line. (The hash-field TTL commands in V.6 need 7.4+.)
-
-> **Demonstrate the "base64 is not encryption" point out loud** — it lands better than saying it:
-> ```bash
-> kubectl -n nosql-lab get secret redis-auth -o jsonpath='{.data.redis-password}' | base64 -d; echo
-> ```
+ ```
 
 ---
 
@@ -1009,22 +1150,35 @@ stringData:
 `k3s/20-redis-statefulset.yaml`:
 
 ```yaml
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 20-redis-statefulset.yaml
+#
 # StatefulSet (not Deployment) because Redis is stateful:
-#   * stable network identity  -> redis-0.redis-headless.nosql-lab.svc
-#   * stable per-pod storage   -> volumeClaimTemplates binds a PVC to the ordinal
+#   * stable network identity -> redis-0.redis-headless.nosql-lab.svc
+#   * stable per-pod storage  -> volumeClaimTemplates binds a PVC to the ordinal
 #   * ordered, graceful rollout
+#
 # K3s ships local-path-provisioner as the default StorageClass, so the PVC is
 # satisfied automatically with no extra setup.
-# -----------------------------------------------------------------------------
+#
+# PRODUCTION NOTE: replicas: 1 is a LAB SIMPLIFICATION. Real HA means either a
+# primary plus replicas with Sentinel, or Redis Cluster — normally deployed via
+# the Bitnami Helm chart or a purpose-built operator, which handle failover
+# orchestration, PodDisruptionBudgets, and anti-affinity.
+# Naively raising 'replicas' here gives you N INDEPENDENT, UNRELATED Redis
+# servers, not a replicated one. Rolling your own StatefulSet-based failover is
+# a known footgun.
+# =============================================================================
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: redis
   namespace: nosql-lab
+  labels:
+    app: redis
 spec:
-  serviceName: redis-headless      # MUST match the headless Service name (III.6)
-  replicas: 1                      # single node; see the HA note below
+  serviceName: redis-headless      # MUST match the headless Service name
+  replicas: 1
   selector:
     matchLabels:
       app: redis
@@ -1033,6 +1187,25 @@ spec:
       labels:
         app: redis
     spec:
+      # -----------------------------------------------------------------------
+      # Kubernetes injects Docker-link-style environment variables for EVERY
+      # Service in the namespace, in the form:
+      #     <SERVICENAME>_PORT=tcp://<clusterIP>:<port>
+      #     <SERVICENAME>_SERVICE_HOST=<clusterIP>
+      #     <SERVICENAME>_SERVICE_PORT=<port>
+      #
+      # With Services named 'redis', 'jupyter', and 'redisinsight' in this
+      # namespace, that means REDIS_PORT, JUPYTER_PORT and REDISINSIGHT_PORT
+      # all get injected into every pod — and several applications read
+      # variables by exactly those names, then fail parsing 'tcp://10.43.x.y:z'
+      # as an integer.
+      #
+      # We resolve everything by DNS Service name instead, so the legacy
+      # injection buys us nothing and can only cause collisions. Turn it off
+      # everywhere as a matter of hygiene.
+      # -----------------------------------------------------------------------
+      enableServiceLinks: false
+
       # fsGroup makes the mounted PVC group-writable by the redis user (999),
       # so redis-server can create dump.rdb and the appendonlydir. Without it
       # you get 'Permission denied' on the first BGSAVE on some provisioners.
@@ -1040,10 +1213,10 @@ spec:
         fsGroup: 999
 
       # Redis warns at startup if the node's accept backlog is smaller than
-      # tcp-backlog. This init container tunes the node sysctls. If you already
-      # applied them on the host in III.2, this is belt-and-braces and can be
-      # deleted — which is the cleaner production posture, since it lets you
-      # drop the privileged container entirely.
+      # tcp-backlog. This init container tunes the node sysctls.
+      # If you already applied them on the host, DELETE this block — that is
+      # the cleaner production posture, since it lets you drop the privileged
+      # container entirely.
       initContainers:
         - name: sysctl-tuning
           image: busybox:1.36
@@ -1061,7 +1234,6 @@ spec:
       containers:
         - name: redis
           # Official upstream image, major version pinned for reproducibility.
-          # Check https://hub.docker.com/_/redis for the current stable major.
           image: redis:8-alpine
           imagePullPolicy: IfNotPresent
 
@@ -1098,11 +1270,11 @@ spec:
 
           volumeMounts:
             - name: config
-              mountPath: /etc/redis      # redis.conf from the ConfigMap
+              mountPath: /etc/redis          # redis.conf from the ConfigMap
             - name: redis-data
-              mountPath: /data           # RDB + AOF on the PersistentVolume
+              mountPath: /data               # RDB + AOF on the PersistentVolume
 
-          # Requests drive scheduling; the memory LIMIT must exceed 'maxmemory'
+          # Requests drive scheduling; the memory LIMIT must EXCEED 'maxmemory'
           # (512Mi) with headroom for copy-on-write during BGSAVE, client output
           # buffers, and allocator overhead — otherwise the kernel OOM-kills the
           # pod and you get an exit-137 CrashLoopBackOff with no Redis log.
@@ -1161,6 +1333,7 @@ spec:
         resources:
           requests:
             storage: 2Gi
+
 ```
 
 > **Production note for the 400-level audience:** `replicas: 1` is a lab simplification. Real HA means either a primary plus replicas with Sentinel, or Redis Cluster — normally deployed via the Bitnami Helm chart or a purpose-built operator, which handle failover orchestration, `PodDisruptionBudget`s, and anti-affinity. Naively raising `replicas` here gives you *N independent, unrelated Redis servers*, not a replicated one. Rolling your own StatefulSet-based failover is a known footgun.
@@ -1174,9 +1347,24 @@ Three Services, each solving a different problem. Understanding why you need all
 `k3s/30-redis-service.yaml`:
 
 ```yaml
+# =============================================================================
+# 30-redis-service.yaml
+#
+# Three Services, each solving a different problem. Understanding why you need
+# all three is most of the Kubernetes networking lesson.
+#
+# A NAMING CAVEAT WORTH KNOWING: because a Service here is named 'redis',
+# Kubernetes injects REDIS_PORT=tcp://<clusterIP>:6379 into every pod in this
+# namespace that has service links enabled. Any application reading a variable
+# literally named REDIS_PORT will get a URL where it expected an integer.
+# Every pod in this lab therefore sets 'enableServiceLinks: false' and passes
+# connection details explicitly.
+# =============================================================================
+
 # -----------------------------------------------------------------------------
-# 1) Headless Service — required by the StatefulSet for stable per-pod DNS:
-#    redis-0.redis-headless.nosql-lab.svc.cluster.local
+# 1) HEADLESS — required by the StatefulSet for stable per-pod DNS:
+#      redis-0.redis-headless.nosql-lab.svc.cluster.local
+#
 # clusterIP: None means no virtual IP and no load balancing; DNS returns the
 # pod IPs directly. This is how you address a SPECIFIC replica — essential once
 # you have a primary and replicas and need to talk to one of them by name.
@@ -1186,6 +1374,8 @@ kind: Service
 metadata:
   name: redis-headless
   namespace: nosql-lab
+  labels:
+    app: redis
 spec:
   clusterIP: None
   selector:
@@ -1196,15 +1386,17 @@ spec:
       targetPort: 6379
 ---
 # -----------------------------------------------------------------------------
-# 2) ClusterIP Service — the normal in-cluster endpoint. Jupyter and
-#    RedisInsight pods connect to the hostname 'redis' on port 6379.
-#    This is the address you will type into RedisInsight in IV.2.
+# 2) CLUSTERIP — the normal in-cluster endpoint. Jupyter and RedisInsight pods
+#    connect to the hostname 'redis' on port 6379. This is the address you type
+#    into the RedisInsight connection form.
 # -----------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
   name: redis
   namespace: nosql-lab
+  labels:
+    app: redis
 spec:
   type: ClusterIP
   selector:
@@ -1215,8 +1407,9 @@ spec:
       targetPort: 6379
 ---
 # -----------------------------------------------------------------------------
-# 3) NodePort Service — makes Redis reachable from the HOST at localhost:30079,
-#    so a redis-cli or a Python process running OUTSIDE the cluster can connect.
+# 3) NODEPORT — makes Redis reachable from the HOST at localhost:30079, so a
+#    redis-cli or Python process running OUTSIDE the cluster can connect.
+#
 #    Ingress cannot do this: Redis speaks RESP over raw TCP, not HTTP, so the
 #    Traefik HTTP ingress that ships with K3s is the wrong tool.
 # -----------------------------------------------------------------------------
@@ -1225,6 +1418,8 @@ kind: Service
 metadata:
   name: redis-nodeport
   namespace: nosql-lab
+  labels:
+    app: redis
 spec:
   type: NodePort
   selector:
@@ -1234,193 +1429,7 @@ spec:
       port: 6379
       targetPort: 6379
       nodePort: 30079        # host-reachable: localhost:30079
-```
 
-| Service | Type | Who uses it | Address |
-|---|---|---|---|
-| `redis-headless` | Headless | The StatefulSet controller; per-replica addressing | `redis-0.redis-headless.nosql-lab.svc.cluster.local:6379` |
-| `redis` | ClusterIP | Pods inside the cluster (Jupyter, RedisInsight) | `redis:6379` |
-| `redis-nodeport` | NodePort | Tools on your host machine | `localhost:30079` |
-
----
-
-### III.7 RedisInsight and JupyterLab
-
-`k3s/40-redisinsight.yaml`:
-
-```yaml
-# -----------------------------------------------------------------------------
-# RedisInsight in-cluster, exposed on the host via NodePort 30054.
-# Stateless enough for a Deployment; a small PVC keeps saved connections and
-# UI preferences across restarts.
-# -----------------------------------------------------------------------------
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: redisinsight-data
-  namespace: nosql-lab
-spec:
-  accessModes: ["ReadWriteOnce"]
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: 1Gi
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: redisinsight
-  namespace: nosql-lab
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: redisinsight
-  template:
-    metadata:
-      labels:
-        app: redisinsight
-    spec:
-      # The image writes to /data as UID 1000; fsGroup makes the PVC
-      # group-writable so the container can create its SQLite state file.
-      securityContext:
-        fsGroup: 1000
-      containers:
-        - name: redisinsight
-          image: redis/redisinsight:latest
-          ports:
-            - containerPort: 5540
-          volumeMounts:
-            - name: data
-              mountPath: /data
-          resources:
-            requests: { cpu: "100m", memory: "256Mi" }
-            limits:   { cpu: "500m", memory: "1Gi" }
-          readinessProbe:
-            httpGet:
-              path: /
-              port: 5540
-            initialDelaySeconds: 20
-            periodSeconds: 10
-      volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: redisinsight-data
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redisinsight
-  namespace: nosql-lab
-spec:
-  type: NodePort
-  selector:
-    app: redisinsight
-  ports:
-    - port: 5540
-      targetPort: 5540
-      nodePort: 30054        # host-reachable: http://localhost:30054
-```
-
-`k3s/50-jupyter.yaml`:
-
-```yaml
-# -----------------------------------------------------------------------------
-# JupyterLab in-cluster, exposed on the host via NodePort 30088.
-# It resolves Redis through the in-cluster DNS name 'redis' (the ClusterIP
-# Service), which is service discovery in Kubernetes demonstrated in one line.
-# The PVC at /home/jovyan/work holds BOTH the notebooks and the generated
-# dataset (VI.1), so nothing is lost when the pod restarts.
-# -----------------------------------------------------------------------------
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: jupyter-work
-  namespace: nosql-lab
-spec:
-  accessModes: ["ReadWriteOnce"]
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: 2Gi
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: jupyter
-  namespace: nosql-lab
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: jupyter
-  template:
-    metadata:
-      labels:
-        app: jupyter
-    spec:
-      securityContext:
-        fsGroup: 100            # 'users' group — jovyan's group in the image
-      containers:
-        - name: jupyter
-          image: quay.io/jupyter/scipy-notebook:latest
-          # Install the Redis clients, then start the server with a fixed token.
-          # In a locked-down environment, bake these into a custom image instead
-          # of pip-installing at boot — a pod restart should not need egress.
-          command:
-            - bash
-            - -c
-            - |
-              pip install --quiet --no-cache-dir 'redis[hiredis]>=5.0' faker
-              exec start-notebook.py --IdentityProvider.token="$JUPYTER_TOKEN"
-          env:
-            - name: JUPYTER_TOKEN
-              value: "nosql-lab"
-            # Kubernetes DNS: 'redis' resolves to the ClusterIP Service in this
-            # namespace. Fully qualified: redis.nosql-lab.svc.cluster.local
-            - name: REDIS_HOST
-              value: "redis"
-            - name: REDIS_PORT
-              value: "6379"
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: redis-auth
-                  key: redis-password
-          ports:
-            - containerPort: 8888
-          volumeMounts:
-            - name: work
-              mountPath: /home/jovyan/work
-          resources:
-            requests: { cpu: "250m", memory: "512Mi" }
-            limits:   { cpu: "2000m", memory: "2Gi" }
-          readinessProbe:
-            httpGet:
-              path: /api
-              port: 8888
-            # Generous: the pip install must finish before the server starts.
-            initialDelaySeconds: 45
-            periodSeconds: 10
-            failureThreshold: 12
-      volumes:
-        - name: work
-          persistentVolumeClaim:
-            claimName: jupyter-work
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: jupyter
-  namespace: nosql-lab
-spec:
-  type: NodePort
-  selector:
-    app: jupyter
-  ports:
-    - port: 8888
-      targetPort: 8888
-      nodePort: 30088        # host-reachable: http://localhost:30088
 ```
 
 > **Note the asymmetry worth pointing out:** Jupyter receives `REDIS_PASSWORD` from the Secret as an environment variable, but RedisInsight does not — RedisInsight stores credentials in its own encrypted local database when you add a connection through the UI. That is why IV.2 has you type the password in by hand.

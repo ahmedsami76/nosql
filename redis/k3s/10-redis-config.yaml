@@ -1,32 +1,49 @@
-# -----------------------------------------------------------------------------
-# ConfigMap: the full redis.conf, decoupled from the image so it can change
-# without a rebuild. We deliberately configure rather than accept defaults,
-# because the shipped defaults are tuned for a cache, not for a teaching lab.
+# =============================================================================
+# 10-redis-config.yaml
 #
-# NOTE: this file contains NO password. 'requirepass' is injected at startup
-# from the Secret below, so the credential never appears in a ConfigMap (which
-# is world-readable to anyone with 'get configmap' in this namespace).
+# Two objects, and the split between them is the lesson:
+#   ConfigMap -> non-secret configuration
+#   Secret    -> credentials
+#
+# The ConfigMap carries the full redis.conf, decoupled from the image so it can
+# change without a rebuild. We configure deliberately rather than accept the
+# shipped defaults, because those defaults are tuned for a cache, not a
+# teaching lab.
+#
+# THERE IS NO PASSWORD IN THIS CONFIGMAP. 'requirepass' is injected at startup
+# from the Secret as a command-line override, so the credential never appears
+# in a ConfigMap (which is readable by anyone with 'get configmap' here).
 #
 # !! REDIS CONFIG SYNTAX WARNING — the single most common cause of a Redis pod
 # !! that CrashLoopBackOffs on first boot:
-# !! redis.conf does NOT support trailing comments. Only a line whose FIRST
-# !! non-space character is '#' is treated as a comment. Writing
-# !!     save 900 1        # snapshot after 15 minutes
-# !! makes Redis parse '#', 'snapshot', 'after'... as arguments to 'save' and
-# !! abort with "Invalid save parameters". Every comment below is therefore on
-# !! its own line. Check this first when a config change breaks startup.
-# -----------------------------------------------------------------------------
+# !!
+# !!   redis.conf does NOT support TRAILING comments. Only a line whose FIRST
+# !!   non-space character is '#' is treated as a comment. Writing
+# !!       save 900 1        # snapshot after 15 minutes
+# !!   makes Redis parse '#', 'snapshot', 'after' ... as arguments to 'save'
+# !!   and abort with "Invalid save parameters".
+# !!
+# !! Every comment below is therefore on its own line. Check this FIRST when a
+# !! config change breaks startup.
+#
+# MINIMUM VERSION: 'set-max-listpack-entries' requires Redis 7.2+. On 7.0 the
+# server refuses to start with "Bad directive or wrong number of arguments".
+# The redis:8-alpine image pinned in 20-redis-statefulset.yaml satisfies this.
+# Hash-field TTL commands (HEXPIRE/HTTL) need 7.4+.
+# =============================================================================
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: redis-config
   namespace: nosql-lab
+  labels:
+    app: redis
 data:
   redis.conf: |
     ################################## NETWORK #################################
     # Bind to all interfaces INSIDE the pod's network namespace. The namespace
     # plus the Service is the isolation boundary; nothing outside the cluster
-    # reaches this port except through the Services defined in III.6.
+    # reaches this port except through the Services in 30-redis-service.yaml.
     bind 0.0.0.0
     port 6379
 
@@ -57,12 +74,15 @@ data:
     ################################## MEMORY ##################################
     # Hard cap on the dataset. Redis applies maxmemory-policy once this is hit.
     # Sized small ON PURPOSE so students can trigger eviction in a live demo.
-    # The container memory LIMIT must sit comfortably above this — see III.5.
+    # The container memory LIMIT must sit comfortably ABOVE this — see the
+    # StatefulSet, which uses 1Gi for this 512mb cap.
     maxmemory 512mb
 
     # allkeys-lfu evicts the least-FREQUENTLY used key across the whole
-    # keyspace — the best general-purpose cache policy. Use 'noeviction' when
-    # Redis is a system of record and silent data loss is unacceptable.
+    # keyspace — the best general-purpose CACHE policy, and it resists a single
+    # large scan flushing the working set.
+    # Use 'noeviction' when Redis is a system of record and silent data loss is
+    # unacceptable: writes then fail loudly instead of evicting.
     maxmemory-policy allkeys-lfu
 
     # Keys sampled per eviction decision. Higher = closer to true LFU, at more
@@ -92,16 +112,15 @@ data:
 
     # CRC64 trailer: costs ~10% on load, catches silent corruption.
     rdbchecksum yes
-
     dbfilename dump.rdb
 
     # --- AOF: append-only command log, replayed at startup ---
     appendonly yes
     appendfilename "appendonly.aof"
 
-    # Durability dial:
+    # Durability dial — this is a BUSINESS decision, not a tuning knob:
     #   always   = fsync every write  (safest, slowest)
-    #   everysec = fsync once/second  (default: <= 1s loss window)  <-- our choice
+    #   everysec = fsync once/second  (default: <= 1s loss window)  <-- ours
     #   no       = let the OS flush   (fastest, largest loss window)
     appendfsync everysec
 
@@ -119,7 +138,7 @@ data:
 
     ############################## DATA STRUCTURES #############################
     # Thresholds where a compact encoding is swapped for a full one. Demo these
-    # live with OBJECT ENCODING before and after crossing a threshold (V.7).
+    # live with OBJECT ENCODING before and after crossing a threshold.
     hash-max-listpack-entries 128
     hash-max-listpack-value 64
     list-max-listpack-size 128
@@ -140,29 +159,35 @@ data:
     # Keyspace notifications, so we can demo event-driven cache invalidation:
     #   K = keyspace events, E = keyevent events, A = all classes
     notify-keyspace-events "KEA"
-
     loglevel notice
 
     ################################# THREADING ################################
-    # I/O threads parallelize socket read/write and protocol parsing ONLY.
-    # Command execution stays single-threaded. Keep this below the container's
-    # CPU limit (1000m in III.5) or the threads just fight for the same quota.
+    # I/O threads parallelize socket read/write and RESP protocol parsing ONLY.
+    # COMMAND EXECUTION REMAINS SINGLE-THREADED. Keep this below the container's
+    # CPU limit or the threads just fight for the same quota.
     io-threads 2
 ---
-# -----------------------------------------------------------------------------
-# Secret: the Redis password. 'stringData' lets us write plaintext in the
-# manifest and have Kubernetes base64-encode it on admission.
+# =============================================================================
+# Secret: the Redis password.
+#
+# 'stringData' lets us write plaintext in the manifest and have Kubernetes
+# base64-encode it on admission.
 #
 # NOTE FOR STUDENTS: base64 is ENCODING, not encryption. Anyone with
-# 'get secret' in this namespace can read it back in one command. In
-# production use sealed-secrets, the External Secrets Operator, or a cloud
+# 'get secret' in this namespace reads it back in one command:
+#   kubectl -n nosql-lab get secret redis-auth \
+#     -o jsonpath='{.data.redis-password}' | base64 -d
+#
+# In production use sealed-secrets, the External Secrets Operator, or a cloud
 # KMS CSI driver, and enable encryption-at-rest for etcd.
-# -----------------------------------------------------------------------------
+# =============================================================================
 apiVersion: v1
 kind: Secret
 metadata:
   name: redis-auth
   namespace: nosql-lab
+  labels:
+    app: redis
 type: Opaque
 stringData:
   redis-password: "RedisLab2026!"

@@ -1,15 +1,46 @@
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 50-jupyter.yaml
+#
 # JupyterLab in-cluster, exposed on the host via NodePort 30088.
-# It resolves Redis through the in-cluster DNS name 'redis' (the ClusterIP
+# Resolves Redis through the in-cluster DNS name 'redis' (the ClusterIP
 # Service), which is service discovery in Kubernetes demonstrated in one line.
+#
 # The PVC at /home/jovyan/work holds BOTH the notebooks and the generated
-# dataset (VI.1), so nothing is lost when the pod restarts.
+# dataset, so nothing is lost when the pod restarts.
+#
 # -----------------------------------------------------------------------------
+# THE BUG THIS FILE EXISTS TO PREVENT — read this before changing anything.
+#
+# Kubernetes injects Docker-link-style environment variables for EVERY Service
+# in the namespace:
+#     <SERVICENAME>_PORT=tcp://<clusterIP>:<port>
+#
+# Our Service below is named 'jupyter'. That makes Kubernetes set:
+#     JUPYTER_PORT=tcp://10.43.144.55:8888
+#
+# ...which is EXACTLY the variable Jupyter Server parses as its integer port.
+# The result is a hard startup failure, and the traceback points at traitlets,
+# not at Kubernetes, so it reads as a Jupyter bug:
+#
+#     ValueError: invalid literal for int() with base 10:
+#                 'tcp://10.43.144.55:8888'
+#
+# The same trap applies to REDIS_PORT (Service 'redis') for any client that
+# reads that variable name directly.
+#
+# TWO DEFENCES, both applied below:
+#   1. enableServiceLinks: false   — stop the injection entirely
+#   2. explicit JUPYTER_PORT / REDIS_PORT env vars and an explicit --port flag
+#      — so the pod is immune regardless of Service naming
+# -----------------------------------------------------------------------------
+# =============================================================================
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: jupyter-work
   namespace: nosql-lab
+  labels:
+    app: jupyter
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: local-path
@@ -22,8 +53,26 @@ kind: Deployment
 metadata:
   name: jupyter
   namespace: nosql-lab
+  labels:
+    app: jupyter
 spec:
   replicas: 1
+
+  # ---------------------------------------------------------------------------
+  # Recreate, NOT the default RollingUpdate.
+  #
+  # A RollingUpdate with replicas: 1 starts the NEW pod BEFORE terminating the
+  # old one. Both then want the same ReadWriteOnce 'jupyter-work' PVC, and the
+  # new server can exit because the old one still holds Jupyter's runtime
+  # directory and SQLite state.
+  #
+  # This is also why you can end up with TWO Jupyter pods where the old one is
+  # still Running and serving stale notebooks on the NodePort while the new one
+  # sits in Error — you test the wrong container without realising it.
+  # ---------------------------------------------------------------------------
+  strategy:
+    type: Recreate
+
   selector:
     matchLabels:
       app: jupyter
@@ -32,25 +81,58 @@ spec:
       labels:
         app: jupyter
     spec:
+      # DEFENCE 1 — see the header. Without this, JUPYTER_PORT is injected as
+      # 'tcp://<ip>:8888' and Jupyter Server dies on startup.
+      enableServiceLinks: false
+
       securityContext:
         fsGroup: 100            # 'users' group — jovyan's group in the image
+
       containers:
         - name: jupyter
           image: quay.io/jupyter/scipy-notebook:latest
-          # Install the Redis clients, then start the server with a fixed token.
-          # In a locked-down environment, bake these into a custom image instead
-          # of pip-installing at boot — a pod restart should not need egress.
+          imagePullPolicy: IfNotPresent
+
+          # Install the Redis clients, then start the server.
+          #
+          # The pip install is deliberately NOT chained with '&&': a registry
+          # hiccup, proxy, or offline node would otherwise take the whole pod
+          # down with it. In a locked-down environment, bake these packages
+          # into a custom image instead — a pod restart should not need egress.
+          #
+          # --port and --ip are passed EXPLICITLY (defence 2) so nothing is left
+          # to environment inference.
           command:
             - bash
             - -c
             - |
-              pip install --quiet --no-cache-dir 'redis[hiredis]>=5.0' faker
-              exec start-notebook.py --IdentityProvider.token="$JUPYTER_TOKEN"
+              set -u
+              pip install --quiet --no-cache-dir 'redis[hiredis]>=5.0' faker \
+                || echo "WARNING: pip install failed — continuing with whatever is present"
+              exec start-notebook.py \
+                   --IdentityProvider.token="$JUPYTER_TOKEN" \
+                   --ip=0.0.0.0 \
+                   --port=8888
+
           env:
+            # --- DEFENCE 2 -----------------------------------------------------
+            # Explicitly pin the port Jupyter Server reads. An explicitly
+            # declared env var always wins over an injected one, so this holds
+            # even if someone re-enables service links later.
+            - name: JUPYTER_PORT
+              value: "8888"
+
             - name: JUPYTER_TOKEN
               value: "nosql-lab"
+
+            # --- Redis connection ---------------------------------------------
             # Kubernetes DNS: 'redis' resolves to the ClusterIP Service in this
             # namespace. Fully qualified: redis.nosql-lab.svc.cluster.local
+            #
+            # NOTE: REDIS_PORT below is the SAME class of collision as
+            # JUPYTER_PORT — the Service named 'redis' would inject
+            # REDIS_PORT=tcp://<ip>:6379. Setting it explicitly here means
+            # int(os.getenv("REDIS_PORT")) in the notebooks always works.
             - name: REDIS_HOST
               value: "redis"
             - name: REDIS_PORT
@@ -60,22 +142,42 @@ spec:
                 secretKeyRef:
                   name: redis-auth
                   key: redis-password
+
           ports:
-            - containerPort: 8888
+            - name: http
+              containerPort: 8888
+
           volumeMounts:
             - name: work
               mountPath: /home/jovyan/work
+
           resources:
-            requests: { cpu: "250m", memory: "512Mi" }
-            limits:   { cpu: "2000m", memory: "2Gi" }
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+
+          # Generous delay: the pip install must finish before the server
+          # starts. If the pod is OOMKilled instead (exit 137), raise the
+          # memory limit rather than these timings.
           readinessProbe:
             httpGet:
               path: /api
               port: 8888
-            # Generous: the pip install must finish before the server starts.
             initialDelaySeconds: 45
             periodSeconds: 10
             failureThreshold: 12
+
+          livenessProbe:
+            httpGet:
+              path: /api
+              port: 8888
+            initialDelaySeconds: 120
+            periodSeconds: 20
+            failureThreshold: 6
+
       volumes:
         - name: work
           persistentVolumeClaim:
@@ -86,11 +188,14 @@ kind: Service
 metadata:
   name: jupyter
   namespace: nosql-lab
+  labels:
+    app: jupyter
 spec:
   type: NodePort
   selector:
     app: jupyter
   ports:
-    - port: 8888
+    - name: http
+      port: 8888
       targetPort: 8888
       nodePort: 30088        # host-reachable: http://localhost:30088
