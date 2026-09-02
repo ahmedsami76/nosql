@@ -1,0 +1,16 @@
+# =============================================================================
+# 00-namespace.yaml
+#
+# Isolates every object in this module. Deleting the namespace deletes the lab.
+#
+# NOTE: this is 'mongo-lab', NOT 'nosql-lab'. Module 1 (Redis) uses nosql-lab,
+# and the two modules use different NodePorts, so both labs can run side by
+# side on one node. If RAM is tight, tear down Module 1 first.
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mongo-lab
+  labels:
+    course: nosql
+    module: "02-document"

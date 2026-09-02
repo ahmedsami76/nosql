@@ -1,0 +1,143 @@
+# =============================================================================
+# 10-mongodb-config.yaml
+#
+# Three objects:
+#   ConfigMap    -> mongod.conf (non-secret configuration)
+#   Secret       -> root credentials
+#   Secret       -> the replica-set KEYFILE
+#
+# THE KEYFILE IS THE PART PEOPLE GET WRONG. In MongoDB, enabling authentication
+# ('security.authorization: enabled') ALSO requires internal authentication
+# between replica-set members. The simplest mechanism is a shared keyfile:
+# every member presents the same secret to every other member.
+#
+# Two hard requirements that cause silent, confusing failures:
+#   1. The keyfile MUST be mode 0400 or 0600 and owned by the mongodb user.
+#      mongod REFUSES TO START on a permissions error. Kubernetes Secret
+#      volumes are mounted read-only but with a group-readable default mode,
+#      so we set defaultMode explicitly AND copy it to an emptyDir in an init
+#      container (a projected Secret volume cannot always satisfy mongod's
+#      ownership check on every provisioner).
+#   2. The content must be base64-ish text, 6-1024 characters. Generate with:
+#          openssl rand -base64 756
+#      A short or newline-mangled keyfile produces an obscure startup error.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongodb-config
+  namespace: mongo-lab
+  labels:
+    app: mongodb
+data:
+  mongod.conf: |
+    # -------------------------------------------------------------------------
+    # mongod.conf is YAML — unlike redis.conf in Module 1, INLINE COMMENTS ARE
+    # LEGAL here. That single difference is worth pointing out: the Redis
+    # trailing-comment trap does not apply to MongoDB.
+    # -------------------------------------------------------------------------
+    net:
+      port: 27017
+      # Bind to all interfaces INSIDE the pod's network namespace. The namespace
+      # plus the Service is the isolation boundary.
+      bindIp: 0.0.0.0
+      # Cap concurrent connections. Each costs ~1 MB of stack plus driver-side
+      # state; runaway connection counts are a classic production incident.
+      maxIncomingConnections: 500
+
+    storage:
+      dbPath: /data/db
+      wiredTiger:
+        engineConfig:
+          # The WiredTiger cache holds UNCOMPRESSED pages and MVCC versions.
+          # Default is max(50% of (RAM - 1GB), 256MB). We pin it EXPLICITLY so
+          # it cannot exceed the container memory limit -- if WT sizes itself
+          # from the NODE's RAM (which it does on older versions without
+          # cgroup awareness), the kernel OOM-kills the pod and you get exit
+          # 137 with no mongod log. Keep this well below the container limit.
+          cacheSizeGB: 0.5
+          journalCompressor: snappy
+        collectionConfig:
+          # snappy is the default: fast, decent ratio. 'zstd' compresses far
+          # better at more CPU. 'none' only if you are CPU-starved.
+          blockCompressor: snappy
+        indexConfig:
+          prefixCompression: true
+
+    replication:
+      # THE NAME OF THE REPLICA SET. Every member must agree on this string,
+      # and it appears in every connection URI as ?replicaSet=rs0.
+      replSetName: rs0
+      # Oplog size. The oplog is a CAPPED COLLECTION -- when it wraps, a
+      # secondary that has fallen further behind than the window can no longer
+      # catch up incrementally and requires a full initial sync.
+      # 2 GB is plenty for a lab; production sizes this to hold several hours
+      # of writes so a secondary can survive a long maintenance window.
+      oplogSizeMB: 2048
+
+    security:
+      # Enables RBAC. From this point on, EVERY connection must authenticate.
+      authorization: enabled
+      # Internal member-to-member authentication. See the header comment.
+      keyFile: /etc/mongodb-keyfile/keyfile
+
+    operationProfiling:
+      # 'slowOp' logs operations exceeding slowOpThresholdMs to the profiler
+      # collection. Set to 'off' in production unless you are investigating;
+      # 'all' is a debugging tool, never a steady state.
+      mode: slowOp
+      slowOpThresholdMs: 100
+
+    systemLog:
+      destination: file
+      path: /data/db/mongod.log
+      logAppend: true
+      # Also emit to stdout so 'kubectl logs' works. Without this you have to
+      # exec into the pod to read the log, which is miserable during a
+      # CrashLoopBackOff.
+      logRotate: reopen
+
+    setParameter:
+      # Allows the balancer and chunk migrations to be observed in Part 8.
+      enableLocalhostAuthBypass: false
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-auth
+  namespace: mongo-lab
+  labels:
+    app: mongodb
+type: Opaque
+stringData:
+  # The root/admin user, created by the init Job in 40-mongodb-init-job.yaml.
+  mongo-root-username: "admin"
+  mongo-root-password: "MongoLab2026!"
+  # A least-privilege application user, also created by the init Job. The
+  # notebooks and mongo-express use THIS one, not root -- demonstrating RBAC
+  # rather than just describing it.
+  mongo-app-username: "retail_app"
+  mongo-app-password: "RetailApp2026!"
+  # base64 is ENCODING, not encryption. Anyone with 'get secret' here reads it:
+  #   kubectl -n mongo-lab get secret mongodb-auth \
+  #     -o jsonpath='{.data.mongo-root-password}' | base64 -d
+  # In production: sealed-secrets, External Secrets Operator, or a KMS CSI
+  # driver, plus etcd encryption-at-rest.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mongodb-keyfile
+  namespace: mongo-lab
+  labels:
+    app: mongodb
+type: Opaque
+stringData:
+  # ---------------------------------------------------------------------------
+  # REGENERATE THIS BEFORE ANY REAL USE:
+  #     openssl rand -base64 756 | tr -d '\n'
+  #
+  # It must be 6-1024 characters from the base64 alphabet. The value below is a
+  # valid placeholder so the lab applies cleanly out of the box.
+  # ---------------------------------------------------------------------------
+  keyfile: "c2FtcGxlLWxhYi1rZXlmaWxlLXJlcGxhY2UtbWUtaW4tcHJvZHVjdGlvbi10aGlzLXN0cmluZy1tdXN0LWJlLWlkZW50aWNhbC1vbi1ldmVyeS1yZXBsaWNhLXNldC1tZW1iZXItYW5kLWJldHdlZW4tNi1hbmQtMTAyNC1iYXNlNjQtY2hhcmFjdGVycy1sb25nLTEyMzQ1Njc4OTA="

@@ -1,0 +1,266 @@
+# =============================================================================
+# 20-mongodb-statefulset.yaml
+#
+# A 3-MEMBER REPLICA SET, not a standalone server.
+#
+# Why 3 and not 1: in MongoDB, multi-document transactions, change streams,
+# and causally-consistent sessions ALL require a replica set. A standalone
+# mongod would force us to skip Part 7 and most of Part 8.
+#
+# Why 3 and not 2: a replica set elects a primary by MAJORITY. With 2 members,
+# a majority is 2, so losing either one leaves the survivor unable to elect
+# itself and the set goes READ-ONLY. 3 members tolerate 1 failure. This is the
+# same overlap argument as Raft quorums -- odd numbers only.
+#
+# StatefulSet (not Deployment) because each member needs:
+#   * a stable network identity  -> mongodb-0.mongodb-headless.mongo-lab.svc
+#     (a replica set config stores HOSTNAMES; a pod IP that changes on restart
+#      would break the set permanently)
+#   * stable per-pod storage     -> volumeClaimTemplates, one PVC per ordinal
+#   * ordered, graceful rollout
+#
+# IF YOU ARE SHORT ON RAM: set replicas: 1. Everything still works -- a
+# single-member replica set is a valid replica set, and transactions and change
+# streams both function. You just cannot demonstrate failover in Part 8.
+# =============================================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: mongo-lab
+  labels:
+    app: mongodb
+spec:
+  serviceName: mongodb-headless      # MUST match the headless Service name
+  replicas: 3
+  # Start all three at once rather than waiting for each to be Ready. Safe
+  # here because the members do not depend on each other until rs.initiate()
+  # runs, and it makes the lab come up far faster.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      # -----------------------------------------------------------------------
+      # THE LESSON FROM MODULE 1, APPLIED PREEMPTIVELY.
+      #
+      # Kubernetes injects Docker-link-style env vars for EVERY Service in the
+      # namespace:  <SERVICENAME>_PORT=tcp://<clusterIP>:<port>
+      #
+      # Our Services are named 'mongodb', 'mongo-express', and 'jupyter', so
+      # MONGODB_PORT, MONGO_EXPRESS_PORT and JUPYTER_PORT all get injected into
+      # every pod here. Several applications read variables by exactly those
+      # names and then fail parsing 'tcp://10.43.x.y:27017' as an integer --
+      # which is precisely how the Jupyter pod died in Module 1.
+      #
+      # mongo-express in particular reads ME_CONFIG_MONGODB_PORT and is
+      # sensitive to this class of collision. We resolve everything by DNS
+      # Service name, so the legacy injection buys us nothing.
+      # -----------------------------------------------------------------------
+      enableServiceLinks: false
+
+      # The official image runs as UID/GID 999 (mongodb). fsGroup makes the
+      # mounted PVC group-writable so mongod can create its dbPath files.
+      # Without it: 'Permission denied' on /data/db and an immediate crash.
+      securityContext:
+        fsGroup: 999
+
+      initContainers:
+        # ---------------------------------------------------------------------
+        # Copy the keyfile from the read-only Secret mount into an emptyDir and
+        # chmod it to 0400.
+        #
+        # WHY THIS IS NECESSARY: mongod refuses to start if the keyfile is
+        # readable by group or other. Kubernetes Secret volumes are mounted
+        # read-only, so mongod cannot fix the permissions itself, and
+        # defaultMode alone does not always survive every CSI/provisioner's
+        # ownership semantics. Copying to an emptyDir we control is the
+        # reliable pattern, and it is what every production Helm chart does.
+        # ---------------------------------------------------------------------
+        - name: keyfile-permissions
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              cp /secret/keyfile /keyfile/keyfile
+              chmod 0400 /keyfile/keyfile
+              chown 999:999 /keyfile/keyfile
+              echo "keyfile staged:"
+              ls -l /keyfile/keyfile
+          volumeMounts:
+            - name: keyfile-secret
+              mountPath: /secret
+              readOnly: true
+            - name: keyfile
+              mountPath: /keyfile
+
+      containers:
+        - name: mongodb
+          # Major version pinned for reproducibility. 8.x is current; 7.x also
+          # works with every command in this module.
+          image: mongo:8.0
+          imagePullPolicy: IfNotPresent
+
+          # Start mongod with our ConfigMap. Note there is NO --auth flag: it
+          # comes from security.authorization in mongod.conf.
+          #
+          # THE BOOTSTRAP PARADOX: authorization is enabled from the first
+          # start, but no users exist yet, so nobody can log in to create one.
+          # MongoDB resolves this with the LOCALHOST EXCEPTION -- before any
+          # user exists, a connection from localhost may create the first user
+          # and nothing else. The init Job (40-...) uses exactly that window.
+          command:
+            - mongod
+            - --config=/etc/mongodb/mongod.conf
+            # Bind the replica set member to its STABLE DNS NAME, not its pod
+            # IP. This is the single most important line in the file: a replica
+            # set config stores hostnames, and a pod IP changes on every
+            # restart. Getting this wrong produces a set that works until the
+            # first reschedule and then breaks irrecoverably.
+            - --bind_ip_all
+
+          env:
+            # Explicit, so nothing is inferred from an injected variable even
+            # if someone re-enables service links later. Same defence-in-depth
+            # as Module 1's JUPYTER_PORT fix.
+            - name: MONGODB_PORT
+              value: "27017"
+            # The pod's own stable DNS name, assembled from the downward API.
+            # Used by the readiness probe and handy inside the container.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MONGO_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-auth
+                  key: mongo-root-username
+            - name: MONGO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-auth
+                  key: mongo-root-password
+
+          ports:
+            - name: mongodb
+              containerPort: 27017
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mongodb
+            - name: keyfile
+              mountPath: /etc/mongodb-keyfile
+            - name: mongodb-data
+              mountPath: /data/db
+
+          # Requests drive scheduling. The memory LIMIT must EXCEED the
+          # WiredTiger cacheSizeGB (0.5 GB in our ConfigMap) with substantial
+          # headroom for connection stacks, the oplog buffer, index builds, and
+          # aggregation working memory -- otherwise the kernel OOM-kills the
+          # pod and you get exit 137 with no mongod log at all.
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1500Mi"
+
+          # ---------------------------------------------------------------------
+          # PROBES: note the deliberate asymmetry.
+          #
+          # Liveness uses a plain 'ping', which succeeds even on a SECONDARY and
+          # even before rs.initiate(). We only want a restart if the process is
+          # genuinely wedged -- restarting a healthy secondary because it is not
+          # primary would be a disaster.
+          #
+          # Readiness ALSO accepts secondaries, because our headless Service
+          # must resolve ALL members for the replica set to form. A readiness
+          # probe demanding PRIMARY would deadlock the bootstrap: no member can
+          # become primary until they can see each other, and they cannot see
+          # each other until they are Ready.
+          # ---------------------------------------------------------------------
+          livenessProbe:
+            exec:
+              command:
+                - mongosh
+                - --quiet
+                - --eval
+                - "db.adminCommand('ping').ok"
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 6
+
+          readinessProbe:
+            exec:
+              command:
+                - mongosh
+                - --quiet
+                - --eval
+                - "db.adminCommand('ping').ok"
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
+
+          # Startup probe gives a slow first boot (journal recovery, index
+          # rebuild) up to 5 minutes before liveness starts counting.
+          startupProbe:
+            exec:
+              command:
+                - mongosh
+                - --quiet
+                - --eval
+                - "db.adminCommand('ping').ok"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 30
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+      # Give mongod time to finish a checkpoint and step down cleanly. A
+      # primary that is SIGKILLed mid-write forces the replica set into an
+      # election with no graceful handover.
+      terminationGracePeriodSeconds: 30
+
+      volumes:
+        - name: config
+          configMap:
+            name: mongodb-config
+        - name: keyfile-secret
+          secret:
+            secretName: mongodb-keyfile
+            defaultMode: 0400
+        - name: keyfile
+          emptyDir: {}
+
+  # Each pod ordinal gets its own PVC: mongodb-data-mongodb-0, -1, -2.
+  # Deleting a pod does NOT delete its data; deleting the StatefulSet does NOT
+  # delete the PVCs either. You must remove them explicitly (see teardown).
+  volumeClaimTemplates:
+    - metadata:
+        name: mongodb-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 5Gi

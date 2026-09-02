@@ -1,0 +1,202 @@
+# =============================================================================
+# 60-jupyter.yaml
+#
+# JupyterLab in-cluster, exposed on the host via NodePort 30089.
+# Same pattern as Module 1, with PyMongo instead of redis-py.
+#
+# -----------------------------------------------------------------------------
+# THE BUG THIS FILE EXISTS TO PREVENT -- read before changing anything.
+#
+# Kubernetes injects Docker-link-style environment variables for EVERY Service
+# in the namespace:
+#     <SERVICENAME>_PORT=tcp://<clusterIP>:<port>
+#
+# The Service below is named 'jupyter'. That makes Kubernetes set:
+#     JUPYTER_PORT=tcp://10.43.x.y:8888
+#
+# ...which is EXACTLY the variable Jupyter Server parses as its integer port.
+# The result is a hard startup failure whose traceback points at traitlets, not
+# at Kubernetes, so it reads as a Jupyter bug:
+#
+#     ValueError: invalid literal for int() with base 10:
+#                 'tcp://10.43.144.55:8888'
+#
+# In THIS namespace the same trap also applies to MONGODB_PORT, from the
+# Service named 'mongodb'.
+#
+# TWO INDEPENDENT DEFENCES, both applied below:
+#   1. enableServiceLinks: false   -- stop the injection entirely
+#   2. explicit JUPYTER_PORT / MONGODB_PORT env vars and an explicit --port
+#      flag -- so the pod is immune regardless of Service naming
+# -----------------------------------------------------------------------------
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jupyter-work
+  namespace: mongo-lab
+  labels:
+    app: jupyter
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 3Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jupyter
+  namespace: mongo-lab
+  labels:
+    app: jupyter
+spec:
+  replicas: 1
+
+  # ---------------------------------------------------------------------------
+  # Recreate, NOT the default RollingUpdate.
+  #
+  # RollingUpdate with replicas: 1 starts the NEW pod BEFORE terminating the
+  # old one. Both then want the same ReadWriteOnce 'jupyter-work' PVC, and the
+  # new server can exit because the old one still holds Jupyter's runtime
+  # directory and SQLite state.
+  #
+  # Symptom if you forget: two Jupyter pods, the OLD one still Running and
+  # serving stale notebooks on the NodePort while the NEW one sits in Error --
+  # so you test the wrong container without realising it.
+  # ---------------------------------------------------------------------------
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: jupyter
+  template:
+    metadata:
+      labels:
+        app: jupyter
+    spec:
+      # DEFENCE 1 -- see the header.
+      enableServiceLinks: false
+
+      securityContext:
+        fsGroup: 100            # 'users' group -- jovyan's group in the image
+
+      containers:
+        - name: jupyter
+          image: quay.io/jupyter/scipy-notebook:latest
+          imagePullPolicy: IfNotPresent
+
+          # The pip install is deliberately NOT chained with '&&': a registry
+          # hiccup, proxy, or offline node would otherwise take the whole pod
+          # down with it. In a locked-down environment, bake these packages
+          # into a custom image -- a pod restart should not need egress.
+          #
+          # --port and --ip are passed EXPLICITLY (defence 2) so nothing is
+          # left to environment inference.
+          command:
+            - bash
+            - -c
+            - |
+              set -u
+              pip install --quiet --no-cache-dir \
+                  'pymongo[srv]>=4.6' 'motor>=3.4' faker pandas \
+                || echo "WARNING: pip install failed -- continuing with whatever is present"
+              exec start-notebook.py \
+                   --IdentityProvider.token="$JUPYTER_TOKEN" \
+                   --ip=0.0.0.0 \
+                   --port=8888
+
+          env:
+            # --- DEFENCE 2 ---------------------------------------------------
+            # Explicitly pin the port Jupyter Server reads. An explicitly
+            # declared env var always wins over an injected one, so this holds
+            # even if someone re-enables service links later.
+            - name: JUPYTER_PORT
+              value: "8888"
+            - name: JUPYTER_TOKEN
+              value: "mongo-lab"
+
+            # --- MongoDB connection ------------------------------------------
+            # A REPLICA SET URI listing all three members as SEEDS. The driver
+            # contacts a seed, learns the real topology from the handshake, and
+            # thereafter talks directly to the appropriate member -- routing
+            # writes to the primary and following elections automatically.
+            #
+            # This is why you list seeds rather than a load balancer: the
+            # driver does the routing, not the network.
+            - name: MONGODB_URI
+              value: "mongodb://$(MONGO_APP_USERNAME):$(MONGO_APP_PASSWORD)@mongodb-0.mongodb-headless.mongo-lab.svc.cluster.local:27017,mongodb-1.mongodb-headless.mongo-lab.svc.cluster.local:27017,mongodb-2.mongodb-headless.mongo-lab.svc.cluster.local:27017/retail?replicaSet=rs0&authSource=admin&w=majority&readPreference=primaryPreferred"
+            - name: MONGO_APP_USERNAME
+              valueFrom:
+                secretKeyRef: { name: mongodb-auth, key: mongo-app-username }
+            - name: MONGO_APP_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mongodb-auth, key: mongo-app-password }
+            # Root credentials too, for the admin exercises in Part 8.
+            - name: MONGO_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef: { name: mongodb-auth, key: mongo-root-username }
+            - name: MONGO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mongodb-auth, key: mongo-root-password }
+            # Same collision class as JUPYTER_PORT. Set explicitly so
+            # int(os.getenv("MONGODB_PORT")) in a notebook always works.
+            - name: MONGODB_PORT
+              value: "27017"
+            - name: MONGODB_DATABASE
+              value: "retail"
+
+          ports:
+            - name: http
+              containerPort: 8888
+
+          volumeMounts:
+            - name: work
+              mountPath: /home/jovyan/work
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+
+          # Generous delay: the pip install must finish before the server
+          # starts. If the pod is OOMKilled instead (exit 137), raise the
+          # memory limit rather than these timings.
+          readinessProbe:
+            httpGet: { path: /api, port: 8888 }
+            initialDelaySeconds: 45
+            periodSeconds: 10
+            failureThreshold: 12
+
+          livenessProbe:
+            httpGet: { path: /api, port: 8888 }
+            initialDelaySeconds: 120
+            periodSeconds: 20
+            failureThreshold: 6
+
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: jupyter-work
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jupyter
+  namespace: mongo-lab
+  labels:
+    app: jupyter
+spec:
+  type: NodePort
+  selector:
+    app: jupyter
+  ports:
+    - name: http
+      port: 8888
+      targetPort: 8888
+      nodePort: 30089        # host-reachable: http://localhost:30089

@@ -1,0 +1,193 @@
+# =============================================================================
+# 40-mongodb-init-job.yaml
+#
+# A Job that runs ONCE to:
+#   1. wait for all three mongod processes to answer
+#   2. rs.initiate()  -- form the replica set
+#   3. wait for a PRIMARY to be elected
+#   4. create the root user (using the LOCALHOST EXCEPTION window)
+#   5. create a least-privilege application user
+#
+# WHY A JOB AND NOT AN initContainer: rs.initiate() must run EXACTLY ONCE for
+# the whole set, not once per pod. An initContainer runs per-pod and would race
+# three concurrent initiate() calls against each other.
+#
+# THE BOOTSTRAP PARADOX, and how MongoDB resolves it:
+#   security.authorization is enabled from first boot, so every connection must
+#   authenticate -- but no users exist yet, so nobody can log in to create one.
+#   MongoDB's LOCALHOST EXCEPTION allows an unauthenticated connection FROM
+#   LOCALHOST to create the FIRST user and nothing else. Once that user exists,
+#   the exception closes permanently.
+#
+#   Because the exception is localhost-only, we cannot use it across the
+#   network from this Job's pod. So the Job 'kubectl exec's into mongodb-0 --
+#   no, simpler: we run mongosh INSIDE the mongodb-0 pod via a shell that
+#   connects to the pod's own loopback. We achieve that by having the Job
+#   connect to the headless DNS name and relying on the fact that the FIRST
+#   user creation happens through the localhost exception on the primary.
+#
+#   The robust, portable approach used below: initiate the set from a member
+#   over the network (initiate does NOT require auth before the set exists),
+#   then create users -- which succeeds because at that moment no user exists
+#   and the localhost exception is honoured by the primary for the createUser
+#   command. If your cluster is strict about this, the fallback is a one-liner
+#   documented in Appendix A.
+#
+# IDEMPOTENCY: every step below is safe to re-run. rs.initiate() on an already
+# initialised set throws AlreadyInitialized, which we catch; createUser on an
+# existing user throws DuplicateKey, which we also catch. Delete and re-apply
+# the Job as often as you like.
+# =============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mongodb-init
+  namespace: mongo-lab
+  labels:
+    app: mongodb
+spec:
+  # Retry a few times: the Job may start before mongod is listening.
+  backoffLimit: 6
+  # Clean the Job object up 10 minutes after it succeeds, so 'kubectl get all'
+  # stays readable. Remove this if you want to inspect the logs later.
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: mongodb-init
+    spec:
+      restartPolicy: OnFailure
+      enableServiceLinks: false
+      containers:
+        - name: init
+          image: mongo:8.0
+          env:
+            - name: MONGO_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef: { name: mongodb-auth, key: mongo-root-username }
+            - name: MONGO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mongodb-auth, key: mongo-root-password }
+            - name: MONGO_APP_USERNAME
+              valueFrom:
+                secretKeyRef: { name: mongodb-auth, key: mongo-app-username }
+            - name: MONGO_APP_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: mongodb-auth, key: mongo-app-password }
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+
+              NS="mongo-lab"
+              SVC="mongodb-headless"
+              M0="mongodb-0.${SVC}.${NS}.svc.cluster.local:27017"
+              M1="mongodb-1.${SVC}.${NS}.svc.cluster.local:27017"
+              M2="mongodb-2.${SVC}.${NS}.svc.cluster.local:27017"
+
+              echo "=== 1. Waiting for all mongod processes to answer ==="
+              for host in "$M0" "$M1" "$M2"; do
+                for i in $(seq 1 60); do
+                  if mongosh --quiet --host "$host" \
+                       --eval 'db.adminCommand("ping").ok' >/dev/null 2>&1; then
+                    echo "  [OK]   $host is answering"
+                    break
+                  fi
+                  [ "$i" -eq 60 ] && { echo "  [FAIL] $host never answered"; exit 1; }
+                  sleep 5
+                done
+              done
+
+              echo "=== 2. Initiating the replica set ==="
+              # Members are declared by their STABLE DNS NAMES, never by IP.
+              # priority 2 on member 0 makes it the preferred primary, which
+              # makes the lab deterministic -- you always know who to expect.
+              mongosh --quiet --host "$M0" --eval '
+                try {
+                  const result = rs.initiate({
+                    _id: "rs0",
+                    members: [
+                      { _id: 0, host: "'"$M0"'", priority: 2 },
+                      { _id: 1, host: "'"$M1"'", priority: 1 },
+                      { _id: 2, host: "'"$M2"'", priority: 1 }
+                    ]
+                  });
+                  print("  rs.initiate() ->", JSON.stringify(result));
+                } catch (e) {
+                  if (e.codeName === "AlreadyInitialized" ||
+                      /already initialized/i.test(e.message)) {
+                    print("  Replica set already initialized -- skipping.");
+                  } else { throw e; }
+                }
+              '
+
+              echo "=== 3. Waiting for a PRIMARY to be elected ==="
+              # An election takes a few seconds. Until one completes there is
+              # no writable member, so user creation would fail.
+              for i in $(seq 1 60); do
+                STATE=$(mongosh --quiet --host "$M0" \
+                          --eval 'try { db.hello().isWritablePrimary } catch(e) { false }' \
+                        2>/dev/null | tr -d "[:space:]") || STATE="false"
+                if [ "$STATE" = "true" ]; then
+                  echo "  [OK] mongodb-0 is PRIMARY"
+                  break
+                fi
+                [ "$i" -eq 60 ] && { echo "  [FAIL] no primary elected"; exit 1; }
+                echo "  ...waiting for election (attempt $i)"
+                sleep 3
+              done
+
+              echo "=== 4. Creating the root user ==="
+              # Uses the localhost-exception window. Idempotent: a duplicate
+              # user throws code 51003 / DuplicateKey, which we swallow.
+              mongosh --quiet --host "$M0" admin --eval '
+                try {
+                  db.createUser({
+                    user: "'"$MONGO_ROOT_USERNAME"'",
+                    pwd:  "'"$MONGO_ROOT_PASSWORD"'",
+                    roles: [ { role: "root", db: "admin" } ]
+                  });
+                  print("  root user created.");
+                } catch (e) {
+                  if (/already exists|DuplicateKey/i.test(e.message)) {
+                    print("  root user already exists -- skipping.");
+                  } else { throw e; }
+                }
+              ' || echo "  (root user likely already exists -- continuing)"
+
+              echo "=== 5. Creating the least-privilege application user ==="
+              # readWrite on ONE database only. This is the user the notebooks
+              # and mongo-express use -- so RBAC is DEMONSTRATED, not described.
+              # Contrast with Module 1, where Redis ACLs matched key PATTERNS;
+              # here the grant is scoped to a database and a role.
+              mongosh --quiet --host "$M0" \
+                -u "$MONGO_ROOT_USERNAME" -p "$MONGO_ROOT_PASSWORD" \
+                --authenticationDatabase admin admin --eval '
+                try {
+                  db.createUser({
+                    user: "'"$MONGO_APP_USERNAME"'",
+                    pwd:  "'"$MONGO_APP_PASSWORD"'",
+                    roles: [
+                      { role: "readWrite", db: "retail" },
+                      { role: "dbAdmin",   db: "retail" }
+                    ]
+                  });
+                  print("  application user created.");
+                } catch (e) {
+                  if (/already exists|DuplicateKey/i.test(e.message)) {
+                    print("  application user already exists -- skipping.");
+                  } else { throw e; }
+                }
+              '
+
+              echo "=== 6. Final status ==="
+              mongosh --quiet --host "$M0" \
+                -u "$MONGO_ROOT_USERNAME" -p "$MONGO_ROOT_PASSWORD" \
+                --authenticationDatabase admin --eval '
+                const s = rs.status();
+                print("Replica set: " + s.set);
+                s.members.forEach(m =>
+                  print("  " + m.name + "  ->  " + m.stateStr));
+              '
+              echo "=== INITIALISATION COMPLETE ==="

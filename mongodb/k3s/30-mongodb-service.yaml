@@ -1,0 +1,109 @@
+# =============================================================================
+# 30-mongodb-service.yaml
+#
+# Three Services, each solving a different problem -- the same lesson as
+# Module 1, but replication makes the headless one load-bearing rather than
+# merely instructive.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1) HEADLESS -- THE CRITICAL ONE FOR A REPLICA SET.
+#
+# clusterIP: None means no virtual IP and no load balancing; DNS returns the
+# pod IPs directly, and each pod gets its own stable A record:
+#     mongodb-0.mongodb-headless.mongo-lab.svc.cluster.local
+#     mongodb-1.mongodb-headless.mongo-lab.svc.cluster.local
+#     mongodb-2.mongodb-headless.mongo-lab.svc.cluster.local
+#
+# THE REPLICA SET CONFIG STORES THESE HOSTNAMES. That is why a StatefulSet plus
+# a headless Service is mandatory and a Deployment plus a ClusterIP is not
+# merely suboptimal but actually broken: pod IPs change on reschedule, and a
+# replica set configured with IPs stops working the first time that happens.
+#
+# publishNotReadyAddresses: true is REQUIRED for bootstrap. Before
+# rs.initiate() runs, members may report not-ready; without this flag DNS would
+# not resolve them, so they could never see each other, so the set could never
+# form. Classic chicken-and-egg.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-headless
+  namespace: mongo-lab
+  labels:
+    app: mongodb
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: mongodb
+  ports:
+    - name: mongodb
+      port: 27017
+      targetPort: 27017
+---
+# -----------------------------------------------------------------------------
+# 2) CLUSTERIP -- a convenience endpoint that load-balances across ALL members.
+#
+# USE THIS WITH CARE, and understand why. It round-robins across primary and
+# secondaries, so a write sent here has a 2-in-3 chance of hitting a secondary
+# and being REJECTED with 'not master'.
+#
+# It is fine for: mongo-express's initial connect, health checks, and any
+# driver connection string that names the replica set -- because a
+# replica-set-aware driver uses this only for SEED DISCOVERY, then talks
+# directly to the members it learns about. That distinction is worth stating
+# out loud; it is the single most misunderstood thing about MongoDB URIs.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: mongo-lab
+  labels:
+    app: mongodb
+spec:
+  type: ClusterIP
+  selector:
+    app: mongodb
+  ports:
+    - name: mongodb
+      port: 27017
+      targetPort: 27017
+---
+# -----------------------------------------------------------------------------
+# 3) NODEPORT -- reachable from the HOST at localhost:30017, for mongosh or
+#    Compass running outside the cluster.
+#
+# A CAVEAT THAT BITES EVERYONE, and it is worth demonstrating rather than
+# describing: a replica-set-aware client connecting through this NodePort
+# receives the set's member list during handshake -- and those are IN-CLUSTER
+# DNS NAMES your host cannot resolve. The client then tries to connect to
+# 'mongodb-0.mongodb-headless...' and fails.
+#
+# TWO WORKING OPTIONS FROM THE HOST:
+#   a) Connect in DIRECT mode, bypassing topology discovery:
+#        mongosh "mongodb://admin:...@localhost:30017/?directConnection=true"
+#   b) Use 'kubectl port-forward' to each pod AND add /etc/hosts entries so the
+#      member names resolve. Fiddly; option (a) is what you want for a demo.
+#
+# Full replica-set semantics from outside a Kubernetes cluster normally require
+# a LoadBalancer or split-horizon DNS. Say this out loud -- it is the same
+# class of lesson as 'a container's localhost is not your localhost'.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-nodeport
+  namespace: mongo-lab
+  labels:
+    app: mongodb
+spec:
+  type: NodePort
+  selector:
+    app: mongodb
+  ports:
+    - name: mongodb
+      port: 27017
+      targetPort: 27017
+      nodePort: 30017        # host-reachable: localhost:30017
